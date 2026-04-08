@@ -8,7 +8,7 @@ import { app } from 'electron';
 export interface SyncTarget {
   id: string;
   name: string;
-  type: 'google-drive' | 'onedrive' | 'network';
+  type: 'google-drive' | 'onedrive' | 'dropbox' | 'network';
   basePath: string;
   enabled: boolean;
   lastSync?: string;
@@ -63,13 +63,15 @@ export class CloudSyncManager {
     const googlePaths = [
       path.join(userProfile, 'My Drive (maurofanellijr@gmail.com)'),
       path.join(userProfile, 'My Drive (johndawalka87@gmail.com)'),
+      path.join(userProfile, 'My Drive'),
       path.join(userProfile, 'Google Drive'),
+      path.join(userProfile, 'GoogleDrive'),
       'G:\\My Drive',
     ];
     for (const gp of googlePaths) {
       if (fs.existsSync(gp)) {
         detected.push({
-          id: 'google-drive', name: 'Google Drive (maurofanellijr@gmail.com)',
+          id: 'google-drive', name: 'Google Drive',
           type: 'google-drive', basePath: path.join(gp, DEFAULT_SUBFOLDER), enabled: true
         });
         break;
@@ -80,12 +82,34 @@ export class CloudSyncManager {
     const oneDrivePaths = [
       path.join(userProfile, 'OneDrive'),
       path.join(userProfile, 'OneDrive - CSCU'),
+      path.join(userProfile, 'OneDrive-CSCU'),
+      path.join(userProfile, 'OneDrive - Connecticut State Community College'),
     ];
     for (const op of oneDrivePaths) {
       if (fs.existsSync(op)) {
         detected.push({
-          id: 'onedrive', name: 'OneDrive',
+          id: 'onedrive',
+          name: op.includes('CSCU') || op.includes('Connecticut State Community College') ? 'OneDrive (CSCU)' : 'OneDrive',
           type: 'onedrive', basePath: path.join(op, DEFAULT_SUBFOLDER), enabled: true
+        });
+        break;
+      }
+    }
+
+    // Dropbox — common desktop sync locations
+    const dropboxPaths = [
+      path.join(userProfile, 'Dropbox'),
+      path.join(userProfile, 'Dropbox (Personal)'),
+      path.join(userProfile, 'Dropbox (CSCU)'),
+    ];
+    for (const dp of dropboxPaths) {
+      if (fs.existsSync(dp)) {
+        detected.push({
+          id: 'dropbox',
+          name: dp.includes('CSCU') ? 'Dropbox (CSCU)' : 'Dropbox',
+          type: 'dropbox',
+          basePath: path.join(dp, DEFAULT_SUBFOLDER),
+          enabled: true
         });
         break;
       }

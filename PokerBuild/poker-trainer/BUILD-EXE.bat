@@ -5,9 +5,9 @@ echo   Poker Therapist Suite - Portable EXE Builder
 echo ================================================================
 echo.
 
-cd /d "C:\PokerBuild\poker-trainer"
+pushd "%~dp0" >nul
 if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: Cannot access C:\PokerBuild\poker-trainer
+    echo ERROR: Cannot access %~dp0
     exit /b 1
 )
 
@@ -62,21 +62,46 @@ if %ERRORLEVEL% NEQ 0 (
 )
 echo.
 
+echo [bonus] Creating ZIP archive from release output...
+if exist "scripts\compress-release.ps1" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\compress-release.ps1"
+    if !ERRORLEVEL! NEQ 0 (
+        echo WARNING: ZIP archive creation failed.
+    ) else (
+        echo   ZIP archive created.
+    )
+)
+echo.
+
 REM ── Report results ─────────────────────────────────────────────
 echo ================================================================
 echo   BUILD COMPLETE
 echo ================================================================
-if exist "release\PokerTherapistSuite.exe" (
-    for %%F in ("release\PokerTherapistSuite.exe") do (
+set PORTABLE_EXE=
+for /f "delims=" %%F in ('dir /b /o-d "release\*Portable*.exe" 2^>nul') do (
+    if not defined PORTABLE_EXE set "PORTABLE_EXE=%CD%\release\%%F"
+)
+if defined PORTABLE_EXE (
+    for %%F in ("!PORTABLE_EXE!") do (
         echo   Output: %%~fF
         set /a sizeMB=%%~zF / 1048576
         echo   Size:   !sizeMB! MB
     )
     echo.
-    echo   To run: double-click release\PokerTherapistSuite.exe
+    echo   To run: double-click "!PORTABLE_EXE!"
 ) else (
-    echo   WARNING: Expected output not found at release\PokerTherapistSuite.exe
+    echo   WARNING: Expected portable output not found under release\
     echo   Checking release folder...
     dir /b release\*.exe 2>nul
 )
+
+set ARCHIVE_ZIP=
+for /f "delims=" %%F in ('dir /b /o-d "artifacts\*.zip" 2^>nul') do (
+    if not defined ARCHIVE_ZIP set "ARCHIVE_ZIP=%CD%\artifacts\%%F"
+)
+if defined ARCHIVE_ZIP (
+    echo.
+    echo   Archive: !ARCHIVE_ZIP!
+)
 echo ================================================================
+popd >nul

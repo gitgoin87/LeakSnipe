@@ -49,3 +49,30 @@ test_*.py
 artifacts/
 ai_outputs/
 hud_debug.log
+
+# Node / Electron
+node_modules/
+PokerBuild/node_modules/
+PokerBuild/poker-trainer/node_modules/
+
+# Electron build output (binaries too large for GitHub)
+PokerBuild/poker-trainer/build_output/
+PokerBuild/poker-trainer/build_unpacked/
+PokerBuild/poker-trainer/*.exe
+"PokerBuild/poker-trainer/Poker Therapist.exe"
+
+# Data files (not for version control)
+*.db
+*.csv
+dh2_sync_state.json
+
+# Build output dirs
+PokerBuild/.tmp.driveupload/
+PokerBuild/debug_output/
+PokerBuild/poker-trainer/debug_output/
+PokerBuild/go/
+PokerBuild/poker-trainer/go/
+PokerBuild/tsc_out.txt
+PokerBuild/vite_out.txt
+PokerBuild/eb_out.txt
+

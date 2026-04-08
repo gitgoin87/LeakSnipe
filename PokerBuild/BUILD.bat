@@ -3,6 +3,14 @@ setlocal EnableDelayedExpansion
 title Poker Therapist Suite - Build Installer
 color 0A
 
+for %%I in ("%~dp0poker-trainer") do set "APP_DIR=%%~fI"
+if not exist "!APP_DIR!\package.json" (
+    echo.
+    echo  *** Could not locate the canonical app at !APP_DIR! ***
+    pause
+    exit /b 1
+)
+
 echo.
 echo ================================================================
 echo   Poker Therapist Suite - Windows Installer Builder
@@ -11,7 +19,7 @@ echo   Connects to: CoinPoker, BetACR, DriveHUD2, PokerStars
 echo ================================================================
 echo.
 
-cd /d "C:\PokerBuild\poker-trainer"
+pushd "!APP_DIR!" >nul
 
 REM ── Find Node.js ────────────────────────────────────────────────
 set NODE_EXE=
@@ -26,7 +34,9 @@ REM Common install locations
 for %%c in (
     "C:\Program Files\nodejs\node.exe"
     "C:\Program Files (x86)\nodejs\node.exe"
-    "%LOCALAPPDATA%\Programs\nodejs\node.exe"
+    "C:\Users\user\AppData\Local\Programs\nodejs\node.exe"
+    "D:\Program Files\nodejs\node.exe"
+    "D:\nodejs\node.exe"
 ) do (
     if exist %%c (
         set NODE_EXE=%%~c
@@ -34,9 +44,19 @@ for %%c in (
     )
 )
 
-REM Search nvm versions
-if exist "%APPDATA%\nvm" (
-    for /d %%v in ("%APPDATA%\nvm\v*") do (
+REM Search nvm versions (C: user profile)
+if exist "C:\Users\user\AppData\Roaming\nvm" (
+    for /d %%v in ("C:\Users\user\AppData\Roaming\nvm\v*") do (
+        if exist "%%v\node.exe" (
+            set NODE_EXE=%%v\node.exe
+            goto :found_node
+        )
+    )
+)
+
+REM Search nvm on D: drive
+if exist "D:\nvm" (
+    for /d %%v in ("D:\nvm\v*") do (
         if exist "%%v\node.exe" (
             set NODE_EXE=%%v\node.exe
             goto :found_node
@@ -117,6 +137,17 @@ if !ERRORLEVEL! NEQ 0 (
 echo   [OK] Packaging complete
 echo.
 
+if exist "scripts\compress-release.ps1" (
+    echo [bonus] Creating ZIP archive for the release folder...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\compress-release.ps1"
+    if !ERRORLEVEL! NEQ 0 (
+        echo   [WARN] ZIP archive creation failed
+    ) else (
+        echo   [OK] ZIP archive created
+    )
+    echo.
+)
+
 REM ── Results ─────────────────────────────────────────────────────
 echo ================================================================
 echo   BUILD COMPLETE — Output files:
@@ -163,14 +194,24 @@ if defined PORTABLE_EXE (
     echo.
 )
 
+set ARCHIVE_ZIP=
+for /f "delims=" %%F in ('dir /b /o-d "artifacts\*.zip" 2^>nul') do (
+    if not defined ARCHIVE_ZIP set "ARCHIVE_ZIP=%CD%\artifacts\%%F"
+)
+if defined ARCHIVE_ZIP (
+    echo   ARCHIVE:    !ARCHIVE_ZIP!
+    echo     ^ Share this ZIP when you need a compressed release bundle
+    echo.
+)
+
 echo   After installing:
-echo     - App data:    %%APPDATA%%\Poker Therapist Suite\
-echo     - Database:    %%APPDATA%%\poker-therapist\poker-tracker.sqlite
+echo     - App data:    C:\Users\user\AppData\Roaming\Poker Therapist Suite\
+echo     - Database:    C:\Users\user\AppData\Roaming\poker-therapist\poker-tracker.sqlite
 echo     - Hand histories watched automatically:
-echo         CoinPoker:  %%LOCALAPPDATA%%\CoinPoker\HandHistory
-echo         BetACR:     %%USERPROFILE%%\Documents\ACR Poker\HandHistory
-echo         DriveHUD2:  %%APPDATA%%\DriveHUD 2\ProcessedData
-echo         PokerStars: %%USERPROFILE%%\Documents\PokerStars\HandHistory
+echo         CoinPoker:  C:\Users\user\AppData\Local\CoinPoker\HandHistory
+echo         BetACR:     C:\Users\user\Documents\ACR Poker\HandHistory
+echo         DriveHUD2:  C:\Users\user\AppData\Roaming\DriveHUD 2\ProcessedData
+echo         PokerStars: C:\Users\user\Documents\PokerStars\HandHistory
 echo     - Add custom paths from Settings inside the app
 echo.
 
@@ -181,5 +222,6 @@ if defined SETUP_EXE (
 
 echo.
 echo ================================================================
+popd >nul
 pause
 

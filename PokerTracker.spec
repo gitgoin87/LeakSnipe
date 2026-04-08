@@ -1,18 +1,53 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+project_root = Path.cwd()
+hook_dir = str(project_root / "hooks")
 
 a = Analysis(
     ['poker_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('poker.ico', '.')],
-    hiddenimports=['PIL._tkinter_finder', 'matplotlib', 'matplotlib.backends.backend_tkagg', 'numpy'],
-    hookspath=[],
-    hooksconfig={},
+    datas=[('poker.ico', '.'), ('ai_processor.py', '.')],
+    hiddenimports=[
+        'PIL._tkinter_finder',
+        'matplotlib.backends.backend_tkagg',
+        'win32gui',
+        'win32con',
+        'win32api',
+        'pywintypes',
+        'google.generativeai',
+        'google.ai.generativelanguage',
+        'google.api_core',
+        'google.auth',
+        'grpc',
+        'proto',
+        'openai',
+        'openai._client',
+        'openai.resources',
+        'httpx',
+        'ai_processor',
+    ],
+    hookspath=[hook_dir],
+    hooksconfig={
+        'matplotlib': {
+            'backends': ['TkAgg'],
+        },
+    },
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'PIL.AvifImagePlugin',
+        'PIL.WebPImagePlugin',
+        'PIL.FpxImagePlugin',
+        'PIL.MicImagePlugin',
+        'PIL.ImageCms',
+        'matplotlib.tests',
+        'numpy.tests',
+        'numpy.f2py',
+    ],
     noarchive=False,
-    optimize=0,
+    optimize=1,
 )
 pyz = PYZ(a.pure)
 
@@ -22,7 +57,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='PokerTracker',
+    name='LeakSnipe',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -44,6 +44,16 @@ Write-Host "Building to $outputDir..."
 npx electron-builder --win portable --config.directories.output="$outputDir"
 if ($LASTEXITCODE -ne 0) { Write-Error "Packaging failed"; exit 1 }
 
+# Archive the exact output directory so the build can be shared as a ZIP.
+$archiveScript = Join-Path $PSScriptRoot 'scripts\compress-release.ps1'
+if (Test-Path $archiveScript) {
+    try {
+        & $archiveScript -SourceDir $outputDir
+    } catch {
+        Write-Warning "Release archive failed: $_"
+    }
+}
+
 # 6. Move the exe to the root directory
 Write-Host "Moving Executable to the main folder..."
 # The portable exe is usually named based on product name

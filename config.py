@@ -95,10 +95,13 @@ def load_settings() -> Dict[str, Any]:
     """
     default_settings = {
         "hero_names": {
-            "ACR": "",
             "CoinPoker": "",
             "BetACR": "",
-            "GGPoker": ""
+            "GGPoker": "",
+            "ClubGG": "",
+            "PokerStars": "",
+            "888poker": "",
+            "Ignition": "",
         },
         "scan_dirs": [],
         "auto_refresh": True,
@@ -113,9 +116,6 @@ def load_settings() -> Dict[str, Any]:
         "hud_offset_x": 0,
         "hud_offset_y": 0,
         "hud_site_profiles": {},
-        "dh2_db_path": "",
-        "dh2_auto_sync": False,
-        "dh2_sync_interval": 5,
     }
     
     if not os.path.exists(SETTINGS_PATH):

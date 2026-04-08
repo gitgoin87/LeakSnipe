@@ -370,8 +370,8 @@ function parseSingleHand(text: string, defaultSite: string, heroNameOverride: st
     if (/\*{3}\s*RIVER/i.test(line)) { currentStreet = 'River'; continue; }
     if (/\*{3}\s*SHOW\s*DOWN/i.test(line)) { currentStreet = 'Showdown'; continue; }
 
-    // Post blinds
-    const postMatch = line.match(/^(.+?):\s*posts\s+(?:small|big|dead)?\s*(?:blind)?\s*\$?([\d,.]+)/i);
+    // Post blinds or antes
+    const postMatch = line.match(/^(.+?)(?::\s*|\s+)posts\s+(?:.*?)\$?([\d,.]+)/i);
     if (postMatch) {
       const player = players.find(p => p.name === postMatch[1].trim());
       actions.push({ playerName: postMatch[1].trim(), playerSeat: player?.seat || 0,
@@ -380,7 +380,7 @@ function parseSingleHand(text: string, defaultSite: string, heroNameOverride: st
     }
 
     // Folds
-    const foldMatch = line.match(/^(.+?):\s*folds/i);
+    const foldMatch = line.match(/^(.+?)(?::\s*|\s+)folds/i);
     if (foldMatch) {
       const player = players.find(p => p.name === foldMatch[1].trim());
       actions.push({ playerName: foldMatch[1].trim(), playerSeat: player?.seat || 0,
@@ -389,7 +389,7 @@ function parseSingleHand(text: string, defaultSite: string, heroNameOverride: st
     }
 
     // Checks
-    const checkMatch = line.match(/^(.+?):\s*checks/i);
+    const checkMatch = line.match(/^(.+?)(?::\s*|\s+)checks/i);
     if (checkMatch) {
       const player = players.find(p => p.name === checkMatch[1].trim());
       actions.push({ playerName: checkMatch[1].trim(), playerSeat: player?.seat || 0,
@@ -398,7 +398,7 @@ function parseSingleHand(text: string, defaultSite: string, heroNameOverride: st
     }
 
     // Calls
-    const callMatch = line.match(/^(.+?):\s*calls\s+\$?([\d,.]+)/i);
+    const callMatch = line.match(/^(.+?)(?::\s*|\s+)calls\s+\$?([\d,.]+)/i);
     if (callMatch) {
       const player = players.find(p => p.name === callMatch[1].trim());
       actions.push({ playerName: callMatch[1].trim(), playerSeat: player?.seat || 0,
@@ -407,7 +407,7 @@ function parseSingleHand(text: string, defaultSite: string, heroNameOverride: st
     }
 
     // Bets
-    const betMatch = line.match(/^(.+?):\s*bets\s+\$?([\d,.]+)/i);
+    const betMatch = line.match(/^(.+?)(?::\s*|\s+)bets\s+\$?([\d,.]+)/i);
     if (betMatch) {
       const player = players.find(p => p.name === betMatch[1].trim());
       actions.push({ playerName: betMatch[1].trim(), playerSeat: player?.seat || 0,
@@ -416,7 +416,7 @@ function parseSingleHand(text: string, defaultSite: string, heroNameOverride: st
     }
 
     // Raises
-    const raiseMatch = line.match(/^(.+?):\s*raises\s+\$?([\d,.]+)(?:\s+to\s+\$?([\d,.]+))?/i);
+    const raiseMatch = line.match(/^(.+?)(?::\s*|\s+)raises\s+\$?([\d,.]+)(?:\s+to\s+\$?([\d,.]+))?/i);
     if (raiseMatch) {
       const player = players.find(p => p.name === raiseMatch[1].trim());
       const amount = raiseMatch[3] ? parseFloat(raiseMatch[3].replace(/,/g, '')) : parseFloat(raiseMatch[2].replace(/,/g, ''));
@@ -441,7 +441,7 @@ function parseSingleHand(text: string, defaultSite: string, heroNameOverride: st
     }
 
     // Shows
-    const showMatch = line.match(/^(.+?):\s*shows\s+\[([^\]]+)\]/i);
+    const showMatch = line.match(/^(.+?)(?::\s*|\s+)shows\s+\[([^\]]+)\]/i);
     if (showMatch) {
       const player = players.find(p => p.name === showMatch[1].trim());
       if (player) player.cards = showMatch[2].trim().split(/\s+/);

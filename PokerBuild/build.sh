@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /c/PokerBuild/poker-trainer
+cd "$(dirname "$0")/poker-trainer"
 echo "=== Poker Trainer Build ==="
 echo "Step 1: Installing dependencies"
 pnpm install --no-frozen-lockfile

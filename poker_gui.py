@@ -78,7 +78,7 @@ from themes import THEMES, lighten as _lighten, darken as _darken, blend as _ble
 from models import Hand, HandDatabase
 from parsers import HandParser
 from analysis import LeakEngine, SummaryGenerator
-from importing import HandImporter, DriveHUD2Sync
+from importing import HandImporter, get_default_hh_paths
 from utils import font_style as _font_style, canonical_path as _canonical_path
 
 
@@ -125,14 +125,6 @@ DEFAULT_SETTINGS = {
     ],
     "auto_refresh": True,
     "refresh_interval": 5,
-    "dh2_db_path": r"D:\Users\admin\AppData\Roaming\DriveHUD 2\drivehud2.db",
-    # Additional DH2 databases to sync from (primary is dh2_db_path above)
-    "dh2_db_paths": [
-        r"D:\Users\admin\AppData\Roaming\DriveHUD 2\drivehud2.db",
-        r"D:\Users\admin\AppData\Roaming\DriveHUD 2\drivehud.db",
-    ],
-    "dh2_auto_sync": True,
-    "dh2_sync_interval": 5,
     "theme": "Slate Blue",
     "advanced_mode": False,
     "live_hud_enabled": False,
@@ -1660,83 +1652,6 @@ class HandImporter:
         return f"{total} hands imported from {fcount} files ({', '.join(parts)})"
 
 
-# ─── DriveHUD 2 Database Sync ─────────────────────────────────────────────────
-DH2_DB_DEFAULT = r"C:\Users\user\AppData\Roaming\DriveHUD 2\drivehud.db"
-DH2_STATE_FILE = os.path.join(os.path.dirname(DB_PATH), "dh2_sync_state.json")
-
-# DH2 PokerSiteId → our site name
-# NOTE: BetACR is a WPN skin and shares site IDs 12 and 24 with ACR.
-DH2_SITE_MAP = {44: "CoinPoker", 12: "BetACR", 24: "BetACR"}
-# DH2 GameType int → readable name
-DH2_GAMETYPE_MAP = {1: "NLHE", 2: "LHE", 3: "PLO", 4: "NLO", 5: "PLO8", 29: "NLHE", 30: "NLHE"}
-
-
-def _canonical_path(path):
-    if not path:
-        return ""
-    try:
-        return os.path.normcase(os.path.realpath(os.path.normpath(path)))
-    except Exception:
-        return os.path.normcase(os.path.normpath(path))
-
-
-def _is_drive_root(path):
-    if not path:
-        return False
-    norm = os.path.normpath(path)
-    drive, tail = os.path.splitdrive(norm)
-    return bool(drive) and tail in ("\\", "/")
-
-
-def _candidate_dh2_db_paths(configured_path=""):
-    seen = set()
-    candidates = []
-
-    def add(path):
-        if not path:
-            return
-        key = _canonical_path(path) or os.path.normcase(os.path.normpath(path))
-        if key in seen:
-            return
-        seen.add(key)
-        candidates.append(path)
-
-    add(configured_path)
-    add(DH2_DB_DEFAULT)
-
-    username = os.environ.get("USERNAME", "").strip()
-    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-        drive_root = f"{letter}:\\"
-        if not os.path.isdir(drive_root):
-            continue
-
-        if username:
-            add(os.path.join(drive_root, "Users", username, "AppData", "Roaming", "DriveHUD 2", "drivehud.db"))
-            add(os.path.join(drive_root, "Documents and Settings", username, "AppData", "Roaming", "DriveHUD 2", "drivehud.db"))
-
-        users_root = os.path.join(drive_root, "Users")
-        if os.path.isdir(users_root):
-            try:
-                for entry in os.listdir(users_root):
-                    add(os.path.join(users_root, entry, "AppData", "Roaming", "DriveHUD 2", "drivehud.db"))
-            except OSError:
-                pass
-
-    return candidates
-
-
-def resolve_dh2_db_path(configured_path=""):
-    configured_path = (configured_path or "").strip()
-    if configured_path and os.path.exists(configured_path):
-        return os.path.normpath(configured_path)
-
-    for candidate in _candidate_dh2_db_paths(configured_path):
-        if os.path.exists(candidate):
-            return os.path.normpath(candidate)
-
-    return os.path.normpath(configured_path or DH2_DB_DEFAULT)
-
-
 def normalize_scan_dirs(scan_dirs):
     if scan_dirs is None:
         scan_dirs = DEFAULT_SETTINGS.get("scan_dirs", [])
@@ -1777,7 +1692,6 @@ def normalize_settings(raw_settings):
     else:
         settings["scan_dirs"] = normalize_scan_dirs(None)
 
-    settings["dh2_db_path"] = resolve_dh2_db_path(settings.get("dh2_db_path", DH2_DB_DEFAULT))
     density = str(settings.get("hud_density", "standard")).lower()
     settings["hud_density"] = density if density in HUD_DENSITY_OPTIONS else "standard"
 
@@ -1797,527 +1711,6 @@ def normalize_settings(raw_settings):
         settings["hud_offset_y"] = 0
     settings["hud_site_profiles"] = normalize_hud_site_profiles(settings.get("hud_site_profiles"))
     return settings
-
-
-class DriveHUD2Sync:
-    """Reads hands from DriveHUD 2's SQLite database and imports into our poker_hands.db."""
-
-    def __init__(self, settings, db=None):
-        self.settings = settings
-        self.db = db
-        self.parser = HandParser(settings)
-        self.lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = None
-        self.last_id = 0
-        self.last_sync = None
-        self.total_imported = 0
-        self.dh2_db_path = resolve_dh2_db_path(settings.get("dh2_db_path", DH2_DB_DEFAULT))
-        self.settings["dh2_db_path"] = self.dh2_db_path
-        # Track last-synced ID per secondary DB path: {"<canonical_path>": last_id}
-        self.secondary_last_ids: dict = {}
-        self._load_state()
-
-    def _load_state(self):
-        try:
-            if os.path.exists(DH2_STATE_FILE):
-                with open(DH2_STATE_FILE, "r") as f:
-                    state = json.load(f)
-                self.last_id = state.get("last_id", 0)
-                self.total_imported = state.get("total_imported", 0)
-                # Load per-secondary-DB last_ids (keys prefixed with "last_id_")
-                for key, val in state.items():
-                    if key.startswith("last_id_"):
-                        self.secondary_last_ids[key[len("last_id_"):]] = int(val)
-        except Exception:
-            pass
-
-    def _save_state(self):
-        try:
-            state = {"last_id": self.last_id, "total_imported": self.total_imported}
-            # Persist per-secondary-DB last_ids with "last_id_" prefix
-            for canon_path, lid in self.secondary_last_ids.items():
-                state[f"last_id_{canon_path}"] = lid
-            with open(DH2_STATE_FILE, "w") as f:
-                json.dump(state, f)
-        except Exception:
-            pass
-
-    def _connect_dh2(self):
-        """Open DH2 database in read-only mode to avoid locking conflicts."""
-        self.dh2_db_path = resolve_dh2_db_path(self.settings.get("dh2_db_path", self.dh2_db_path))
-        self.settings["dh2_db_path"] = self.dh2_db_path
-        if not os.path.exists(self.dh2_db_path):
-            return None
-        uri = f"file:{self.dh2_db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=5)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def sync(self):
-        """Pull new hands from DH2 and import them. Returns count of new hands."""
-        conn = self._connect_dh2()
-        if conn is None:
-            return 0
-        try:
-            rows = conn.execute(
-                "SELECT HandHistoryId, HandHistory, PokerSiteId, HandHistoryTimestamp, "
-                "GameType, TournamentNumber FROM HandHistories "
-                "WHERE HandHistoryId > ? ORDER BY HandHistoryId ASC",
-                (self.last_id,)
-            ).fetchall()
-            if not rows:
-                self.last_sync = datetime.now()
-                saved_secondary = self._sync_secondary_dbs()
-                if saved_secondary:
-                    self.total_imported += saved_secondary
-                    self._save_state()
-                return saved_secondary
-
-            saved = 0
-            for row in rows:
-                hh_id = row["HandHistoryId"]
-                raw = row["HandHistory"] or ""
-                site_id = row["PokerSiteId"] or 0
-                site_name = DH2_SITE_MAP.get(site_id, "Unknown")
-                if site_name == "Unknown" and site_id > 0:
-                    print(f"[DriveHUD2] Unknown site ID: {site_id}")
-
-                game_type_id = row["GameType"] or 0
-                tournament_num = row["TournamentNumber"] or ""
-
-                try:
-                    if raw.strip().startswith("<?xml") or raw.strip().startswith("<HandHistory"):
-                        hand = self._parse_dh2_xml(raw, site_name, game_type_id, tournament_num)
-                    else:
-                        hand = self._parse_dh2_text(raw, site_name)
-
-                    if hand and hand.hand_id:
-                        if self.db and not self.db.hand_exists(hand.hand_id):
-                            self.db.save_hand(hand, source_file=f"DriveHUD2:{hh_id}")
-                            saved += 1
-                except Exception:
-                    pass
-
-                self.last_id = max(self.last_id, hh_id)
-
-            self.total_imported += saved
-            self.last_sync = datetime.now()
-
-            # Also sync any configured secondary DH2 databases
-            saved += self._sync_secondary_dbs()
-
-            self._save_state()
-            return saved
-        finally:
-            conn.close()
-
-    def _sync_secondary_dbs(self) -> int:
-        """Sync hands from all secondary DH2 databases listed in settings.dh2_db_paths.
-
-        Each secondary DB tracks its own last_id under secondary_last_ids keyed by
-        canonical path, so they advance independently of the primary DB.
-        Returns total number of new hands imported from all secondary DBs.
-        """
-        total_saved = 0
-        primary_canon = _canonical_path(self.dh2_db_path)
-        extra_paths = self.settings.get("dh2_db_paths", [])
-
-        for raw_path in extra_paths:
-            if not raw_path:
-                continue
-            resolved = resolve_dh2_db_path(raw_path)
-            if not os.path.exists(resolved):
-                continue
-            canon = _canonical_path(resolved)
-            # Skip if this path resolves to the same file as the primary DB
-            if canon == primary_canon:
-                continue
-
-            last_id_for_db = self.secondary_last_ids.get(canon, 0)
-
-            try:
-                uri = f"file:{resolved}?mode=ro"
-                conn2 = sqlite3.connect(uri, uri=True, timeout=5)
-                conn2.execute("PRAGMA journal_mode=WAL")
-                conn2.row_factory = sqlite3.Row
-            except Exception as e:
-                print(f"[DriveHUD2] Cannot open secondary DB {resolved}: {e}")
-                continue
-
-            try:
-                rows = conn2.execute(
-                    "SELECT HandHistoryId, HandHistory, PokerSiteId, HandHistoryTimestamp, "
-                    "GameType, TournamentNumber FROM HandHistories "
-                    "WHERE HandHistoryId > ? ORDER BY HandHistoryId ASC",
-                    (last_id_for_db,)
-                ).fetchall()
-
-                saved = 0
-                for row in rows:
-                    hh_id = row["HandHistoryId"]
-                    raw = row["HandHistory"] or ""
-                    site_id = row["PokerSiteId"] or 0
-                    site_name = DH2_SITE_MAP.get(site_id, "Unknown")
-
-                    game_type_id = row["GameType"] or 0
-                    tournament_num = row["TournamentNumber"] or ""
-
-                    try:
-                        if raw.strip().startswith("<?xml") or raw.strip().startswith("<HandHistory"):
-                            hand = self._parse_dh2_xml(raw, site_name, game_type_id, tournament_num)
-                        else:
-                            hand = self._parse_dh2_text(raw, site_name)
-
-                        if hand and hand.hand_id:
-                            if self.db and not self.db.hand_exists(hand.hand_id):
-                                self.db.save_hand(hand, source_file=f"DriveHUD2-2:{hh_id}")
-                                saved += 1
-                    except Exception:
-                        pass
-
-                    last_id_for_db = max(last_id_for_db, hh_id)
-
-                self.secondary_last_ids[canon] = last_id_for_db
-                total_saved += saved
-
-            except Exception as e:
-                print(f"[DriveHUD2] Error syncing secondary DB {resolved}: {e}")
-            finally:
-                conn2.close()
-
-        return total_saved
-
-    def _parse_dh2_xml(self, xml_text, site_name, game_type_id, tournament_num):
-        """Parse DH2's XML hand history format (used for CoinPoker cash games)."""
-        h = Hand()
-        h.site = site_name
-        hero = self.settings.get("hero_names", {}).get(site_name, "")
-
-        # Extract basic info using regex (lightweight, no xml lib needed)
-        def xval(tag):
-            m = re.search(rf"<{tag}[^>]*>([^<]*)</{tag}>", xml_text, re.I)
-            return m.group(1).strip() if m else ""
-
-        def xattr(element, attr):
-            m = re.search(rf'{attr}="([^"]*)"', element, re.I)
-            return m.group(1) if m else ""
-
-        hand_num = xval("HandId") or xval("HandNumber") or xval("GameNumber")
-        if not hand_num:
-            return None
-        prefix = "CP" if site_name == "CoinPoker" else "BACR"
-        h.hand_id = f"{prefix}_{hand_num}"
-
-        h.game_type = DH2_GAMETYPE_MAP.get(game_type_id, "NLHE")
-        h.is_tournament = bool(tournament_num)
-        h.tournament_id = str(tournament_num) if tournament_num else ""
-
-        # Table info
-        h.table_name = xval("TableName")
-        try:
-            h.max_seats = int(xval("TotalSeatNumber") or xval("NumPlayersSeated") or "0")
-        except ValueError:
-            h.max_seats = 0
-
-        # Timestamp
-        ts = xval("DateOfHandUtc") or xval("DateOfHand")
-        if ts:
-            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %I:%M:%S %p"):
-                try:
-                    h.date = datetime.strptime(ts.split(".")[0], fmt)
-                    break
-                except ValueError:
-                    continue
-        if not h.date:
-            h.date = datetime.now()
-
-        # Hero name from XML (fallback to settings)
-        xml_hero = xval("HeroName") or hero
-
-        # Players
-        player_count = 0
-        for pm in re.finditer(r"<Player\b([^/]*?)/>", xml_text, re.S):
-            elem = pm.group(0)
-            pname = xattr(elem, "PlayerName")
-            try:
-                seat = int(xattr(elem, "SeatNumber") or "0")
-            except ValueError:
-                seat = 0
-            try:
-                stack = float(xattr(elem, "StartingStack") or "0")
-            except ValueError:
-                stack = 0.0
-            is_hero = (pname == xml_hero)
-            h.players[seat] = {"name": pname, "stack": stack, "is_hero": is_hero}
-            player_count += 1
-            if is_hero:
-                # DH2 uses "Cards" attr (e.g. "Th5d"), not "HoleCards"
-                cards_str = xattr(elem, "HoleCards") or xattr(elem, "Cards") or ""
-                if cards_str:
-                    h.hero_cards = " ".join(
-                        cards_str[i:i+2] for i in range(0, len(cards_str) - 1, 2)
-                    )
-        if h.max_seats == 0:
-            h.max_seats = player_count
-
-        # Button seat
-        try:
-            h.button_seat = int(xval("DealerButtonPosition") or "0")
-        except ValueError:
-            h.button_seat = 0
-
-        # Actions → streets
-        action_map = {
-            "SMALL_BLIND": "posts small blind", "BIG_BLIND": "posts big blind",
-            "ANTE": "posts ante", "RAISE": "raises", "CALL": "calls",
-            "CHECK": "checks", "BET": "bets", "FOLD": "folds",
-            "UNCALLED_BET": "uncalled bet", "WINS": "collected",
-            "ALL_IN": "all-in", "POSTS": "posts",
-        }
-        streets_order = ["Preflop", "Flop", "Turn", "River"]
-        streets_map = {}
-        for am in re.finditer(r"<HandAction\b([^/]*?)/>", xml_text, re.S):
-            elem = am.group(0)
-            pname = xattr(elem, "PlayerName")
-            act_type = xattr(elem, "HandActionType")
-            street = xattr(elem, "Street") or "Preflop"
-            try:
-                amount = abs(float(xattr(elem, "Amount") or "0"))
-            except ValueError:
-                amount = 0.0
-            action_str = action_map.get(act_type, act_type.lower())
-            if street not in streets_map:
-                streets_map[street] = {"name": street, "cards": [], "actions": []}
-            streets_map[street]["actions"].append(
-                {"player": pname, "action": action_str, "amount": amount}
-            )
-
-        h.streets = [streets_map[s] for s in streets_order if s in streets_map]
-
-        # Community cards
-        comm = xval("CommunityCards")
-        if comm:
-            h.board_cards = [comm[i:i+2] for i in range(0, len(comm) - 1, 2)]
-
-        # Pot & rake
-        try:
-            h.pot = float(xval("TotalPot") or "0")
-        except ValueError:
-            h.pot = 0.0
-        try:
-            h.rake = float(xval("Rake") or "0")
-        except ValueError:
-            h.rake = 0.0
-
-        # Winners — extract from Player Win attribute (most reliable)
-        for pm in re.finditer(r"<Player\b([^/]*?)/>", xml_text, re.S):
-            elem = pm.group(0)
-            pname = xattr(elem, "PlayerName")
-            try:
-                win_amt = float(xattr(elem, "Win") or "0")
-            except ValueError:
-                win_amt = 0.0
-            if win_amt > 0:
-                h.winners.append({"name": pname, "amount": win_amt})
-
-        # Fallback: check WINS actions (including Summary street)
-        if not h.winners:
-            for am in re.finditer(r'<HandAction\b[^>]*HandActionType="WINS"[^/]*/>', xml_text, re.S):
-                elem = am.group(0)
-                pname = xattr(elem, "PlayerName")
-                try:
-                    amt = abs(float(xattr(elem, "Amount") or "0"))
-                except ValueError:
-                    amt = 0.0
-                if amt > 0:
-                    h.winners.append({"name": pname, "amount": amt})
-
-        # Hero result
-        hero_invested = 0.0
-        hero_won_amt = 0.0
-        for s in h.streets:
-            for act in s["actions"]:
-                if act["player"] == xml_hero:
-                    if act["action"] in ("posts small blind", "posts big blind", "posts ante",
-                                         "raises", "calls", "bets"):
-                        hero_invested += act["amount"]
-                    elif act["action"] in ("collected", "uncalled bet"):
-                        hero_won_amt += act["amount"]
-        h.hero_won = hero_won_amt - hero_invested
-
-        # Hero position
-        h.hero_position = self._calc_hero_position(h, xml_hero)
-        h.raw_text = xml_text
-        return h
-
-    def _parse_dh2_text(self, text, site_name):
-        """Parse DH2's text-format hand history (WPN/ACR tournaments)."""
-        try:
-            hand = self.parser._parse_single(text.strip(), site_name)
-            if hand:
-                hand.raw_text = text.strip()
-            return hand
-        except Exception:
-            return None
-
-    def _calc_hero_position(self, hand, hero):
-        """Determine hero's position from seat/button info."""
-        hero_seat = None
-        for seat, info in hand.players.items():
-            if info.get("is_hero") or info["name"] == hero:
-                hero_seat = seat
-                break
-        if hero_seat is None or hand.button_seat == 0:
-            return ""
-        n = len(hand.players)
-        if n <= 1:
-            return ""
-        if hero_seat == hand.button_seat:
-            return "BTN"
-        seats = sorted(hand.players.keys())
-        btn_idx = seats.index(hand.button_seat) if hand.button_seat in seats else 0
-        hero_idx = seats.index(hero_seat) if hero_seat in seats else 0
-        offset = (hero_idx - btn_idx) % n
-        if offset == 1:
-            return "SB"
-        elif offset == 2:
-            return "BB"
-        elif offset == n - 1:
-            return "CO"
-        else:
-            return "MP"
-
-    # ── Two-way note sync ────────────────────────────────────────────────
-    def push_hand_note(self, hand_number, note, site_id=44):
-        """Push a hand note back to DriveHUD 2's database."""
-        if not os.path.exists(self.dh2_db_path):
-            return False
-        try:
-            conn = sqlite3.connect(self.dh2_db_path, timeout=5)
-            conn.execute(
-                "INSERT OR REPLACE INTO HandNotes (HandNumber, Note, PokerSiteId) "
-                "VALUES (?, ?, ?)",
-                (str(hand_number), note, site_id)
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception:
-            return False
-
-    def push_player_note(self, player_name, note, site_id=44):
-        """Push a player note back to DriveHUD 2's database."""
-        if not os.path.exists(self.dh2_db_path):
-            return False
-        try:
-            conn = sqlite3.connect(self.dh2_db_path, timeout=5)
-            conn.execute(
-                "INSERT OR REPLACE INTO PlayerNotes (PlayerName, Note, PokerSiteId) "
-                "VALUES (?, ?, ?)",
-                (player_name, note, site_id)
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception:
-            return False
-
-    def get_hand_notes(self):
-        """Read all hand notes from DH2."""
-        conn = self._connect_dh2()
-        if conn is None:
-            return []
-        try:
-            rows = conn.execute("SELECT * FROM HandNotes").fetchall()
-            return [dict(r) for r in rows]
-        except Exception:
-            return []
-        finally:
-            conn.close()
-
-    def get_player_notes(self):
-        """Read all player notes from DH2."""
-        conn = self._connect_dh2()
-        if conn is None:
-            return []
-        try:
-            rows = conn.execute("SELECT * FROM PlayerNotes").fetchall()
-            return [dict(r) for r in rows]
-        except Exception:
-            return []
-        finally:
-            conn.close()
-
-    def get_tournaments(self):
-        """Read tournament results from DH2."""
-        conn = self._connect_dh2()
-        if conn is None:
-            return []
-        try:
-            rows = conn.execute(
-                "SELECT TournamentNumber, TournamentName, BuyIn, Rake, Rebuy, "
-                "Placing, WinAmount, PokerSiteId, StartDate "
-                "FROM Tournaments ORDER BY StartDate DESC LIMIT 200"
-            ).fetchall()
-            results = []
-            for r in rows:
-                results.append({
-                    "number": r["TournamentNumber"],
-                    "name": r["TournamentName"],
-                    "buy_in": (r["BuyIn"] or 0) / 100.0,
-                    "rake": (r["Rake"] or 0) / 100.0,
-                    "rebuy": (r["Rebuy"] or 0) / 100.0,
-                    "placing": r["Placing"],
-                    "winnings": (r["WinAmount"] or 0) / 100.0,
-                    "site": DH2_SITE_MAP.get(r["PokerSiteId"], "Unknown"),
-                    "date": r["StartDate"],
-                })
-            return results
-        except Exception:
-            return []
-        finally:
-            conn.close()
-
-    def get_status(self):
-        self.dh2_db_path = resolve_dh2_db_path(self.settings.get("dh2_db_path", self.dh2_db_path))
-        self.settings["dh2_db_path"] = self.dh2_db_path
-        return {
-            "connected": os.path.exists(self.dh2_db_path),
-            "last_id": self.last_id,
-            "total_imported": self.total_imported,
-            "last_sync": self.last_sync.isoformat() if self.last_sync else None,
-            "db_path": self.dh2_db_path,
-        }
-
-    def reset(self):
-        self.last_id = 0
-        self.total_imported = 0
-        self.secondary_last_ids = {}
-        self._save_state()
-
-    def start_polling(self, callback=None, interval=None):
-        """Start background polling for new DH2 hands."""
-        self._stop.clear()
-        poll_interval = interval or self.settings.get("dh2_sync_interval", 5)
-        self._thread = threading.Thread(
-            target=self._poll_loop, args=(callback, poll_interval), daemon=True
-        )
-        self._thread.start()
-
-    def stop_polling(self):
-        self._stop.set()
-
-    def _poll_loop(self, callback, interval):
-        while not self._stop.is_set():
-            try:
-                new_count = self.sync()
-                if callback and new_count > 0:
-                    callback(new_count)
-            except Exception:
-                pass
-            self._stop.wait(interval)
 
 
 # ─── Settings I/O ─────────────────────────────────────────────────────────────
@@ -5266,7 +4659,10 @@ class PokerApp(ctk.CTk):
 
         self.db = HandDatabase()
         self.importer = HandImporter(self.settings, db=self.db)
-        self.dh2_sync = DriveHUD2Sync(self.settings, db=self.db)
+        # Auto-detect hand history paths for all supported sites
+        detected_paths = get_default_hh_paths()
+        if detected_paths and not self.settings.get("scan_dirs"):
+            self.settings["scan_dirs"] = list(detected_paths.values())
         self.leak_engine = LeakEngine(self.settings)
         self.summary_gen = SummaryGenerator()
         self.ocr_engine = PokerOCR()
@@ -6619,81 +6015,6 @@ class PokerApp(ctk.CTk):
                         hover_color=self.theme["green"],
                         command=lambda: self._toggle_advanced_from_settings()).pack(side="left", padx=4)
 
-        # ── DriveHUD 2 Integration Section ───────────────────────────────
-        dh2_frame = ctk.CTkFrame(tab, fg_color=self.theme["bg_panel"],
-                                  border_width=1, border_color=self.theme["border"])
-        dh2_frame.pack(fill="x", padx=6, pady=6)
-        ctk.CTkLabel(dh2_frame, text="♦ DriveHUD 2 Integration", text_color=self.theme["gold"],
-                     font=("Consolas", 14, "bold")).pack(anchor="w", padx=8, pady=4)
-
-        dh2_path_row = ctk.CTkFrame(dh2_frame, fg_color=self.theme["bg_panel"])
-        dh2_path_row.pack(fill="x", padx=8, pady=2)
-        ctk.CTkLabel(dh2_path_row, text="DH2 DB Path:", text_color=self.theme["text"], width=100).pack(side="left")
-        self.dh2_path_var = ctk.StringVar(value=self.settings.get("dh2_db_path", DH2_DB_DEFAULT))
-        ctk.CTkEntry(dh2_path_row, textvariable=self.dh2_path_var, fg_color=self.theme["bg_input"],
-                     text_color=self.theme["text"], width=400).pack(side="left", padx=4)
-        ctk.CTkButton(dh2_path_row, text="Browse", fg_color=self.theme["bg_accent"],
-                      hover_color=self.theme["green"],
-                      text_color=self.theme["text"], width=70, command=self._browse_dh2_path).pack(side="left", padx=4)
-
-        dh2_opts_row = ctk.CTkFrame(dh2_frame, fg_color=self.theme["bg_panel"])
-        dh2_opts_row.pack(fill="x", padx=8, pady=2)
-        self.dh2_auto_var = ctk.BooleanVar(value=self.settings.get("dh2_auto_sync", True))
-        ctk.CTkCheckBox(dh2_opts_row, text="Auto-sync from DH2", variable=self.dh2_auto_var,
-                        text_color=self.theme["text"], fg_color=self.theme["bg_accent"],
-                        hover_color=self.theme["green"]).pack(side="left", padx=4)
-        ctk.CTkLabel(dh2_opts_row, text="Interval (s):", text_color=self.theme["text"]).pack(side="left", padx=(12, 4))
-        self.dh2_interval_var = ctk.StringVar(value=str(self.settings.get("dh2_sync_interval", 5)))
-        ctk.CTkEntry(dh2_opts_row, textvariable=self.dh2_interval_var, fg_color=self.theme["bg_input"],
-                     text_color=self.theme["text"], width=50).pack(side="left", padx=4)
-
-        dh2_btn_row = ctk.CTkFrame(dh2_frame, fg_color=self.theme["bg_panel"])
-        dh2_btn_row.pack(fill="x", padx=8, pady=4)
-        ctk.CTkButton(dh2_btn_row, text="Sync Now", fg_color=self.theme["green"],
-                      hover_color=self.theme["bg_accent"],
-                      text_color=self.theme["bg_base"], width=100, command=self._dh2_sync_now).pack(side="left", padx=4)
-        ctk.CTkButton(dh2_btn_row, text="Reset Sync", fg_color=self.theme["red"],
-                      hover_color=self.theme["bg_accent"],
-                      text_color=self.theme["text"], width=100, command=self._dh2_reset).pack(side="left", padx=4)
-
-        self.dh2_status_label = ctk.CTkLabel(dh2_btn_row, text="", text_color=self.theme["text_dim"],
-                                              font=("Consolas", 11))
-        self.dh2_status_label.pack(side="left", padx=12)
-        self._update_dh2_status()
-
-        # ── Secondary DH2 DB Paths ────────────────────────────────────────
-        dh2_extra_label = ctk.CTkLabel(dh2_frame, text="Additional DH2 DB Paths (one per line):",
-                                       text_color=self.theme["text_dim"], font=("Consolas", 11))
-        dh2_extra_label.pack(anchor="w", padx=8, pady=(4, 0))
-
-        dh2_paths_box, self.dh2_paths_listbox = self._create_scroll_textbox(
-            dh2_frame, height=64, font=("Consolas", 10), wrap="none"
-        )
-        dh2_paths_box.pack(fill="x", padx=8, pady=2)
-        # Populate the listbox with current paths
-        self.dh2_paths_listbox.configure(state="normal")
-        self.dh2_paths_listbox.delete("1.0", "end")
-        for p in self.settings.get("dh2_db_paths", []):
-            self.dh2_paths_listbox.insert("end", p + "\n")
-        self.dh2_paths_listbox.configure(state="normal")
-
-        dh2_extra_btn_row = ctk.CTkFrame(dh2_frame, fg_color=self.theme["bg_panel"])
-        dh2_extra_btn_row.pack(fill="x", padx=8, pady=(0, 4))
-        ctk.CTkLabel(dh2_extra_btn_row, text="Add Path:", text_color=self.theme["text"]).pack(side="left")
-        self.dh2_new_path_var = ctk.StringVar()
-        ctk.CTkEntry(dh2_extra_btn_row, textvariable=self.dh2_new_path_var,
-                     fg_color=self.theme["bg_input"], text_color=self.theme["text"],
-                     width=280).pack(side="left", padx=4)
-        ctk.CTkButton(dh2_extra_btn_row, text="Browse...", fg_color=self.theme["bg_accent"],
-                      hover_color=self.theme["green"], text_color=self.theme["text"],
-                      width=80, command=self._browse_dh2_extra).pack(side="left", padx=2)
-        ctk.CTkButton(dh2_extra_btn_row, text="Add", fg_color=self.theme["green"],
-                      hover_color=self.theme["bg_accent"], text_color=self.theme["bg_base"],
-                      width=55, command=self._add_dh2_extra_path).pack(side="left", padx=4)
-        ctk.CTkButton(dh2_extra_btn_row, text="Remove Last", fg_color=self.theme["red"],
-                      hover_color=self.theme["bg_accent"], text_color=self.theme["text"],
-                      width=100, command=self._remove_dh2_extra_path).pack(side="left", padx=4)
-
         # ── Live HUD Settings ─────────────────────────────────────────────
         hud_frame = ctk.CTkFrame(tab, fg_color=self.theme["bg_panel"],
                                   border_width=1, border_color=self.theme["border"])
@@ -6824,7 +6145,6 @@ class PokerApp(ctk.CTk):
 
         self._action_button(self.taskbar, "Import", self._manual_import, width=96, bold=True).pack(side="left", padx=(8, 4), pady=5)
         self._action_button(self.taskbar, "Reload", self._manual_refresh, width=88).pack(side="left", padx=4, pady=5)
-        self._action_button(self.taskbar, "Sync DH2", self._dh2_sync_now, width=96).pack(side="left", padx=4, pady=5)
 
         self.live_hud_btn = self._action_button(
             self.taskbar, "⬡ Live HUD", self._toggle_live_hud, tone="neutral", width=100
@@ -7008,30 +6328,12 @@ class PokerApp(ctk.CTk):
         total_hands = len(self.importer.get_hands())
         self.after(0, lambda: self._set_status(
             f"Scan: {new_count} new from {file_count} files | {total_hands} total hands"))
-        # Sync from DriveHUD 2 only when enabled (subscription required)
-        if self.settings.get("dh2_auto_sync", False):
-            try:
-                dh2_count = self.dh2_sync.sync()
-                if dh2_count > 0:
-                    self.after(0, lambda: self._set_status(
-                        f"DH2: +{dh2_count} hands | {total_hands + dh2_count} total"))
-            except Exception as e:
-                self.after(0, lambda: self._set_status(f"DH2 sync issue: {e}"))
         self.after(0, self._post_scan)
         if self.settings.get("auto_refresh", True):
             self.importer.start_watcher(callback=self._watcher_callback)
-        if self.settings.get("dh2_auto_sync", True):
-            self.dh2_sync.start_polling(
-                callback=self._dh2_callback,
-                interval=self.settings.get("dh2_sync_interval", 5),
-            )
 
     def _watcher_callback(self, new_count, file_count):
         self.after(0, self._post_scan)
-
-    def _dh2_callback(self, new_count):
-        self.after(0, self._post_scan)
-        self.after(0, lambda: self._update_dh2_status())
 
     def _post_scan(self):
         self._post_scan_generation += 1
@@ -7063,10 +6365,6 @@ class PokerApp(ctk.CTk):
 
     def _do_manual_refresh(self):
         self.importer.full_scan()
-        try:
-            self.dh2_sync.sync()
-        except Exception:
-            pass
         self.after(0, self._post_scan)
 
     def _manual_import(self):
@@ -7954,11 +7252,6 @@ class PokerApp(ctk.CTk):
                     p["classification"] = ptype
                     break
             _populate(search_var.get(), hud_type_var.get())
-            # Also push to DH2 if connected
-            try:
-                self.dh2_sync.push_player_note(pname, f"Type: {ptype}")
-            except Exception:
-                pass
 
         def _clear_override():
             pname = override_name_var.get().strip()
@@ -8585,18 +7878,6 @@ class PokerApp(ctk.CTk):
             self.settings["refresh_interval"] = int(self.interval_var.get())
         except ValueError:
             self.settings["refresh_interval"] = 5
-        # DH2 settings
-        self.settings["dh2_db_path"] = self.dh2_path_var.get().strip()
-        self.settings["dh2_auto_sync"] = self.dh2_auto_var.get()
-        try:
-            self.settings["dh2_sync_interval"] = int(self.dh2_interval_var.get())
-        except ValueError:
-            self.settings["dh2_sync_interval"] = 5
-        # Save secondary DH2 DB paths from the listbox (one path per line)
-        if hasattr(self, "dh2_paths_listbox"):
-            raw_text = self.dh2_paths_listbox.get("1.0", "end")
-            extra_paths = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
-            self.settings["dh2_db_paths"] = extra_paths
 
         # Live HUD settings
         self.settings["live_hud_enabled"] = self.hud_enabled_var.get()
@@ -8615,12 +7896,9 @@ class PokerApp(ctk.CTk):
             self.settings["hud_offset_y"] = 0
 
         self.settings = normalize_settings(self.settings)
-        self.dh2_path_var.set(self.settings["dh2_db_path"])
         self._refresh_dir_list()
         save_settings(self.settings)
         self.importer.update_settings(self.settings)
-        self.dh2_sync.settings = self.settings
-        self.dh2_sync.dh2_db_path = self.settings["dh2_db_path"]
         self._set_status("Settings saved!")
 
         # Reinitialise AI processor with new keys
@@ -8637,15 +7915,6 @@ class PokerApp(ctk.CTk):
             self.importer.start_watcher(callback=self._watcher_callback)
         else:
             self.importer.stop_watcher()
-
-        # Restart DH2 polling with updated settings
-        self.dh2_sync.stop_polling()
-        if self.settings["dh2_auto_sync"]:
-            self.dh2_sync.start_polling(
-                callback=self._dh2_callback,
-                interval=self.settings["dh2_sync_interval"],
-            )
-        self._update_dh2_status()
 
     def _current_hud_profile_payload(self):
         site = self.hud_profile_site_var.get() if hasattr(self, "hud_profile_site_var") else None
@@ -8863,81 +8132,6 @@ class PokerApp(ctk.CTk):
         self._hud_overlays = {}
         self.live_hud_overlay = None
         self._set_status("Live HUD stopped.")
-
-    # ── DriveHUD 2 Actions ────────────────────────────────────────────────
-    def _browse_dh2_path(self):
-        path = filedialog.askopenfilename(
-            title="Select DriveHUD 2 Database",
-            filetypes=[("SQLite Database", "*.db"), ("All Files", "*.*")],
-            initialdir=r"C:\Users\user\AppData\Roaming\DriveHUD 2",
-        )
-        if path:
-            self.dh2_path_var.set(path)
-
-    def _browse_dh2_extra(self):
-        """Browse for an additional DH2 database file and fill the add-path entry."""
-        path = filedialog.askopenfilename(
-            title="Select Additional DriveHUD 2 Database",
-            filetypes=[("SQLite Database", "*.db"), ("All Files", "*.*")],
-        )
-        if path:
-            self.dh2_new_path_var.set(os.path.normpath(path))
-
-    def _add_dh2_extra_path(self):
-        """Append the typed path to the secondary DH2 DB paths listbox."""
-        path = self.dh2_new_path_var.get().strip()
-        if path and hasattr(self, "dh2_paths_listbox"):
-            self.dh2_paths_listbox.configure(state="normal")
-            self.dh2_paths_listbox.insert("end", path + "\n")
-            self.dh2_new_path_var.set("")
-
-    def _remove_dh2_extra_path(self):
-        """Remove the last line from the secondary DH2 DB paths listbox."""
-        if not hasattr(self, "dh2_paths_listbox"):
-            return
-        self.dh2_paths_listbox.configure(state="normal")
-        content = self.dh2_paths_listbox.get("1.0", "end").rstrip("\n")
-        lines = content.splitlines()
-        if lines:
-            lines.pop()
-        self.dh2_paths_listbox.delete("1.0", "end")
-        for ln in lines:
-            self.dh2_paths_listbox.insert("end", ln + "\n")
-
-    def _dh2_sync_now(self):
-        self._set_status("Syncing from DriveHUD 2...")
-        def do_sync():
-            try:
-                count = self.dh2_sync.sync()
-                total = self.dh2_sync.total_imported
-                msg = f"DH2 sync: {count} new | {total} total imported"
-                if count == 0:
-                    msg += " (all caught up)"
-                self.after(0, lambda: self._set_status(msg))
-                if count > 0:
-                    self.after(0, self._post_scan)
-                self.after(0, self._update_dh2_status)
-            except Exception as e:
-                self.after(0, lambda: self._set_status(f"DH2 sync error: {e}"))
-        threading.Thread(target=do_sync, daemon=True).start()
-
-    def _dh2_reset(self):
-        self.dh2_sync.reset()
-        self._update_dh2_status()
-        self._set_status("DH2 sync state reset — next sync will re-import all hands")
-
-    def _update_dh2_status(self):
-        try:
-            status = self.dh2_sync.get_status()
-            if status["connected"]:
-                txt = f"✓ Connected | {status['total_imported']} imported | Last ID: {status['last_id']}"
-                if status["last_sync"]:
-                    txt += f" | Last: {status['last_sync'][:19]}"
-                self.dh2_status_label.configure(text=txt, text_color=self.theme["green"])
-            else:
-                self.dh2_status_label.configure(text="✗ DH2 database not found", text_color=self.theme["red"])
-        except Exception:
-            self.dh2_status_label.configure(text="✗ Status unavailable", text_color=self.theme["red"])
 
 
 # ─── Main Entry Point ─────────────────────────────────────────────────────────

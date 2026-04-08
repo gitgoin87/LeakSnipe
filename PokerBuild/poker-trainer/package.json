@@ -11,7 +11,12 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "package": "npm run build && electron-builder"
+    "package": "npm run build && electron-builder",
+    "package:portable": "npm run build && electron-builder --win portable",
+    "package:win": "npm run build && electron-builder --win nsis portable",
+    "archive:release": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\compress-release.ps1",
+    "release:portable": "npm run package:portable && npm run archive:release",
+    "release:win": "npm run package:win && npm run archive:release"
   },
   "keywords": [
     "Electron",
@@ -26,6 +31,7 @@
     "productName": "Poker Therapist Suite",
     "copyright": "Copyright © 2025 mfane",
     "icon": "build-assets/icon.ico",
+    "compression": "maximum",
     "files": [
       "dist-electron/**/*",
       "dist/**/*"
@@ -68,9 +74,12 @@
     "portable": {
       "artifactName": "PokerTherapistSuite-Portable.${ext}"
     },
-    "asar": false,
+    "asar": true,
     "asarUnpack": [
       "**/*.node"
+    ],
+    "electronLanguages": [
+      "en-US"
     ]
   },
   "dependencies": {

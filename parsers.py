@@ -69,6 +69,40 @@ class HandParser:
     def __init__(self, settings: Dict[str, Any]):
         self.settings = settings
 
+    def _hero_candidates(self, site_label: str) -> List[str]:
+        """Configured hero aliases plus names dealt cards in a hand."""
+        hero_names = self.settings.get("hero_names", {})
+        configured = (
+            hero_names.get(site_label)
+            or hero_names.get("BetACR" if site_label in ("ACR", "BetACR") else site_label, "")
+            or ""
+        )
+        candidates: List[str] = []
+        for part in re.split(r"[,;|]", str(configured)):
+            part = part.strip()
+            if part and part not in candidates:
+                candidates.append(part)
+        return candidates
+
+    def _resolve_hero(self, text: str, site_label: str) -> str:
+        """Pick the hero name that actually played this hand."""
+        dealt: List[str] = []
+        for match in re.finditer(r"Dealt to (.+?) \[(.+?)\]", text):
+            name = match.group(1).strip()
+            if name and name not in dealt:
+                dealt.append(name)
+        if dealt:
+            for alias in self._hero_candidates(site_label):
+                if alias in dealt:
+                    return alias
+            return dealt[0]
+
+        seat_names = set(re.findall(r"Seat \d+: (.+?) \(", text))
+        for alias in self._hero_candidates(site_label):
+            if alias in seat_names:
+                return alias
+        return self._hero_candidates(site_label)[0] if self._hero_candidates(site_label) else ""
+
     def detect_site(self, text: str) -> Optional[str]:
         """Detect which poker site the hand is from based on text content."""
         stripped_text = text.lstrip()
@@ -501,8 +535,8 @@ class HandParser:
         h.site = site_label
         h.raw_text = text
         lines = text.split("\n")
-        hero_names = self.settings.get("hero_names", {})
-        hero = hero_names.get(site_label) or hero_names.get("BetACR", "JohnDaWalka")
+        hero = self._resolve_hero(text, site_label)
+        h.hero_player = hero
 
         header = lines[0] if lines else ""
         m = re.search(r"(?:Game )?Hand #(\d+)", header)
@@ -907,6 +941,8 @@ class HandParser:
 
         if won > 0:
             return won - invested
+        if won == 0 and invested == 0:
+            return 0.0
         return -invested if invested > 0 else 0.0
 
     @staticmethod

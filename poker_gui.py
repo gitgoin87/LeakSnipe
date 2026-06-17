@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 from collections import defaultdict, OrderedDict
 import hashlib
+import math
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog
@@ -78,9 +79,9 @@ from themes import THEMES, lighten as _lighten, darken as _darken, blend as _ble
 from models import Hand, HandDatabase
 from parsers import HandParser
 from analysis import LeakEngine, SummaryGenerator
-from importing import HandImporter, get_default_hh_paths
+from importing import HandImporter, discover_scan_dirs, merge_scan_dirs
 from ocr_capture import OCRCaptureBridge, ReplayWindowCapture
-from utils import font_style as _font_style, canonical_path as _canonical_path
+from utils import font_style as _font_style, canonical_path as _canonical_path, format_hero_result
 
 # ── Global font system ────────────────────────────────────────────────────────
 # UI chrome (labels, buttons, tabs) uses Segoe UI — clean, proportional.
@@ -155,7 +156,7 @@ if not os.path.exists(SETTINGS_PATH):
         SETTINGS_PATH = PARENT_SETTINGS
 
 DEFAULT_SETTINGS = {
-    "hero_names": {"CoinPoker": "jdwalka", "BetACR": "JohnDaWalka", "GGPoker": "JohnDaWalka", "ReplayPoker": ""},
+    "hero_names": {"CoinPoker": "jdwalka", "BetACR": "GBOSS101,JohnDaWalka", "GGPoker": "JohnDaWalka", "ReplayPoker": ""},
     "scan_dirs": [
         {"path": r"D:\Hand2Note4Hh\CoinPoker", "site": "CoinPoker"},
         # BetACR live hand histories (WPN skin — written by ACR Poker client)
@@ -259,26 +260,46 @@ class Hand:
         self.winners: list[dict] = []
         self.hero_won = 0.0
         self.hero_position = ""
+        self.hero_player = ""
         self.raw_text = ""
 
     def hero_name(self, settings):
-        return settings.get("hero_names", {}).get(self.site, "")
+        from utils import resolve_hand_hero_name
+        return resolve_hand_hero_name(
+            settings,
+            self.site,
+            players=self.players,
+            raw_text=self.raw_text,
+            hero_player=getattr(self, "hero_player", ""),
+        )
 
 
 # ─── Hand Database (SQLite) ───────────────────────────────────────────────────
-_DEFAULT_DB_PATH = r"F:\LeakSnipe\poker_hands.db"
+_DEFAULT_DB_PATH = os.path.join(BASE_DIR, "poker_hands.db")
 
 def _resolve_db_path(settings: dict = None) -> str:
-    """Return DB path from settings, env var, or F:\\LeakSnipe default."""
+    """Return DB path from settings, env var, or repo-local default."""
+    if settings is None and os.path.exists(SETTINGS_PATH):
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except Exception:
+            settings = None
     if settings:
-        p = settings.get("db_path", "").strip()
-        if p and os.path.dirname(p):
-            os.makedirs(os.path.dirname(p), exist_ok=True)
+        p = str(settings.get("db_path", "")).strip()
+        if p:
+            if not os.path.isabs(p):
+                p = os.path.join(BASE_DIR, p)
+            parent = os.path.dirname(p)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             return p
     env = os.environ.get("LEAKSNIPE_DB_PATH", "").strip()
     if env:
         return env
-    os.makedirs(os.path.dirname(_DEFAULT_DB_PATH), exist_ok=True)
+    parent = os.path.dirname(_DEFAULT_DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     return _DEFAULT_DB_PATH
 
 DB_PATH = _resolve_db_path()
@@ -465,6 +486,29 @@ class HandDatabase:
             finally:
                 conn.close()
 
+    def reparse_hands_missing_hero(self, parser):
+        """Re-parse stored raw text for hands missing hero cards or position."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT hand_id, site, raw_text, source_file FROM hands "
+                    "WHERE raw_text != '' AND (hero_cards IS NULL OR hero_cards = '' "
+                    "OR hero_position IS NULL OR hero_position = '' OR hero_position = '?')"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        updated = 0
+        for row in rows:
+            site = row["site"] or "BetACR"
+            hand = parser._parse_single(row["raw_text"], site)
+            if hand and hand.hand_id:
+                self.save_hand(hand, source_file=row["source_file"] or "")
+                updated += 1
+        return updated
+
     def get_all_hands(self):
         with self.lock:
             conn = self._connect()
@@ -532,6 +576,8 @@ class HandDatabase:
                             "stack": pr["stack"],
                             "is_hero": bool(pr["is_hero"]),
                         }
+                        if pr["is_hero"]:
+                            h.hero_player = pr["name"]
 
                     streets_map = OrderedDict()
                     for ar in actions_by_hand.get(h.hand_id, []):
@@ -1459,6 +1505,8 @@ class HandParser:
 
         if won > 0:
             return won - invested
+        if won == 0 and invested == 0:
+            return 0.0
         return -invested if invested > 0 else 0.0
 
     def _calc_position(self, h, hero):
@@ -1506,7 +1554,8 @@ class LeakEngine:
             "cbet_opportunities": 0, "cbet_made": 0,
             "by_position": defaultdict(lambda: {"total": 0, "vpip": 0, "pfr": 0}),
             "by_site": defaultdict(lambda: {
-                "total": 0, "vpip": 0, "pfr": 0, "won": 0.0, "lost": 0.0
+                "total": 0, "vpip": 0, "pfr": 0,
+                "won": 0.0, "lost": 0.0, "chip_net": 0.0,
             }),
             "biggest_wins": [], "biggest_losses": [],
         }
@@ -1519,7 +1568,9 @@ class LeakEngine:
             pos = h.hero_position
             stats["by_position"][pos]["total"] += 1
 
-            if h.hero_won > 0:
+            if h.is_tournament:
+                stats["by_site"][h.site]["chip_net"] += h.hero_won
+            elif h.hero_won > 0:
                 stats["by_site"][h.site]["won"] += h.hero_won
             else:
                 stats["by_site"][h.site]["lost"] += abs(h.hero_won)
@@ -1622,6 +1673,7 @@ class LeakEngine:
                 "pfr": round(100 * d["pfr"] / st, 1),
                 "won": round(d["won"], 2),
                 "lost": round(d["lost"], 2),
+                "chip_net": round(d.get("chip_net", 0.0), 0),
                 "net": round(d["won"] - d["lost"], 2),
             }
         result["alerts"] = self._generate_alerts(result)
@@ -3061,7 +3113,7 @@ class MultiHandMonitor:
             finally:
                 conn.close()
 
-
+
 # ─── Live HUD — Stat Tooltip ─────────────────────────────────────────────────
 class HUDStatTooltip(tk.Toplevel):
     """DriveHUD2-style hover popup: overall stats + per-position VPIP/PFR (9-max)."""
@@ -4511,6 +4563,7 @@ class HandReplayerWindow:
         self._win.focus_force()
 
         self._steps = self._build_steps()
+        self._seat_display_map = self._build_seat_display_map()
 
         # Canvas — table + hero card panel
         self._canvas = tk.Canvas(
@@ -4590,7 +4643,7 @@ class HandReplayerWindow:
         # Deal step
         steps.append({
             "type": "deal",
-            "text": f"Deal — Hero: {hand.hero_cards or '??'}",
+            "text": f"Deal — Hero: {hand.hero_cards or '??'} ({hand.hero_position or '?'})",
             "board": [],
         })
 
@@ -4632,10 +4685,18 @@ class HandReplayerWindow:
         # Result step
         won = getattr(hand, "hero_won", 0.0) or 0.0
         pot = getattr(hand, "pot", 0.0) or 0.0
-        if won > 0:
-            result_text = f"Result: Hero won ${won:.2f} | Pot: ${pot:.2f}"
+        result_fmt = format_hero_result(hand, won)
+        if hand.is_tournament:
+            pot_label = f"{pot:,.0f} chips"
         else:
-            result_text = f"Result: Hero lost | Pot: ${pot:.2f}"
+            pot_label = f"${pot:.2f}"
+        if won > 0:
+            result_text = f"Result: Won {result_fmt} | Pot: {pot_label}"
+        elif won < 0:
+            loss_fmt = format_hero_result(hand, abs(won))
+            result_text = f"Result: Lost {loss_fmt} | Pot: {pot_label}"
+        else:
+            result_text = f"Result: Break even | Pot: {pot_label}"
         steps.append({
             "type": "result",
             "text": result_text,
@@ -4645,13 +4706,40 @@ class HandReplayerWindow:
         return steps
 
     # ------------------------------------------------------------------
-    def _seat_pixel(self, seat):
-        """Map seat number to canvas (x, y) pixel, scaled to the table oval area."""
+    def _build_seat_display_map(self):
+        """Map hand-history seat numbers to clockwise display slots with hero at bottom."""
         hand = self._hand
-        max_s = getattr(hand, "max_seats", 6) or 6
-        pos_map = SEAT_POSITIONS.get(max_s, SEAT_POSITIONS[6])
-        fx, fy = pos_map.get(seat, (0.5, 0.5))
-        # Scale y within the table area (TABLE_TOP=20 to HERO_PANEL_Y-10=410)
+        seats_sorted = sorted(hand.players.keys())
+        n = len(seats_sorted)
+        if n == 0:
+            return {}
+        hero_seat = next(
+            (seat for seat, info in hand.players.items() if info.get("is_hero")),
+            seats_sorted[0],
+        )
+        hero_idx = seats_sorted.index(hero_seat)
+        return {
+            seat: (seats_sorted.index(seat) - hero_idx) % n
+            for seat in seats_sorted
+        }
+
+    def _seat_fraction(self, seat):
+        """Normalized table coordinates; slot 0 (hero) sits at the bottom."""
+        n = max(len(self._hand.players), 2)
+        slot = self._seat_display_map.get(seat, 0)
+        if n == 2:
+            return (0.50, 0.85) if slot == 0 else (0.50, 0.18)
+        cx, cy = 0.50, 0.48
+        rx, ry = 0.38, 0.34
+        angle = -math.pi / 2 + (2 * math.pi * slot / n)
+        fx = cx + rx * math.cos(angle)
+        fy = cy - ry * math.sin(angle)
+        return (max(0.10, min(0.90, fx)), max(0.12, min(0.86, fy)))
+
+    # ------------------------------------------------------------------
+    def _seat_pixel(self, seat):
+        """Map seat number to canvas (x, y) pixel on the table oval."""
+        fx, fy = self._seat_fraction(seat)
         px = int(fx * self.CANVAS_W)
         py = int(20 + fy * (self.HERO_PANEL_Y - 30))
         return px, py
@@ -4842,10 +4930,8 @@ class HandReplayerWindow:
                 px, py = self._seat_pixel(seat)
                 vcards = shown.split()
                 vcw, vch, vsp = 36, 50, 40
-                # Show above seat for top-row seats (fy < 0.5), below for bottom
-                max_s = getattr(hand, "max_seats", 6) or 6
-                fy = SEAT_POSITIONS.get(max_s, SEAT_POSITIONS[6]).get(seat, (0.5, 0.5))[1]
-                vy = py + 46 if fy >= 0.5 else py - 62
+                _, fy = self._seat_fraction(seat)
+                vy = py + 46 if fy >= 0.55 else py - 62
                 vtotal = (len(vcards) - 1) * vsp + vcw
                 vstart = px - vtotal // 2 + vcw // 2
                 for j, vc in enumerate(vcards):
@@ -4936,11 +5022,13 @@ class PokerApp(ctk.CTk):
         self.configure(fg_color=self.theme["bg_base"])
 
         self.db = HandDatabase()
+        discovered_dirs = discover_scan_dirs(self.settings)
+        self.settings["scan_dirs"] = merge_scan_dirs(self.settings.get("scan_dirs"), discovered_dirs)
+        if not self.settings["hero_names"].get("BetACR"):
+            self.settings["hero_names"]["BetACR"] = DEFAULT_SETTINGS["hero_names"].get("BetACR", "JohnDaWalka")
+        if discovered_dirs:
+            save_settings(self.settings)
         self.importer = HandImporter(self.settings, db=self.db)
-        # Auto-detect hand history paths for all supported sites
-        detected_paths = get_default_hh_paths()
-        if detected_paths and not self.settings.get("scan_dirs"):
-            self.settings["scan_dirs"] = list(detected_paths.values())
         self.leak_engine = LeakEngine(self.settings)
         self.summary_gen = SummaryGenerator()
         self.ocr_engine = PokerOCR()
@@ -4955,6 +5043,14 @@ class PokerApp(ctk.CTk):
         self.tilt_data = {}
         self._post_scan_generation = 0
         self._last_hands_snapshot = []
+        self._post_scan_debounce_job = None
+        self._hands_active_hand_id = None
+        self._hand_tag_by_id: Dict[str, str] = {}
+        self._hands_list_fingerprint = None
+        self._hand_click_after_id = None
+        self._dashboard_fingerprint = None
+        self._leak_tab_fingerprint = None
+        self._leak_graph_fingerprint = None
 
         # ── AI Engine ─────────────────────────────────────────────────────
         self.ai_processor = None
@@ -5003,7 +5099,7 @@ class PokerApp(ctk.CTk):
         _raw_ai       = self.tabview.tab("AI / GTO")
         _raw_settings = self.tabview.tab("Settings")
 
-        def _scroll_tab(parent):
+        def _scroll_tab(parent, tab_name):
             sf = ctk.CTkScrollableFrame(
                 parent,
                 fg_color="transparent",
@@ -5011,14 +5107,39 @@ class PokerApp(ctk.CTk):
                 scrollbar_button_hover_color=self.theme["border_hl"],
             )
             sf.pack(fill="both", expand=True, pady=(0, 12))
+
+            _orig_wheel = sf._mouse_wheel_all
+
+            def _guarded_wheel(event, name=tab_name, orig=_orig_wheel):
+                try:
+                    if self.tabview.get() != name:
+                        return
+                except Exception:
+                    return
+                orig(event)
+
+            sf._mouse_wheel_all = _guarded_wheel
             return sf
 
-        self.tab_dash     = _scroll_tab(_raw_dash)
-        self.tab_hands    = _scroll_tab(_raw_hands)
-        self.tab_leak     = _scroll_tab(_raw_leak)
-        self.tab_ocr      = _scroll_tab(_raw_ocr)
-        self.tab_ai       = _scroll_tab(_raw_ai)
-        self.tab_settings = _scroll_tab(_raw_settings)
+        def _plain_tab(parent):
+            frame = ctk.CTkFrame(parent, fg_color="transparent")
+            frame.pack(fill="both", expand=True, pady=(0, 12))
+            return frame
+
+        self.tab_dash     = _scroll_tab(_raw_dash, "Dashboard")
+        self.tab_hands    = _plain_tab(_raw_hands)
+        self.tab_leak     = _scroll_tab(_raw_leak, "Leaks")
+        self.tab_ocr      = _scroll_tab(_raw_ocr, "OCR")
+        self.tab_ai       = _scroll_tab(_raw_ai, "AI / GTO")
+        self.tab_settings = _scroll_tab(_raw_settings, "Settings")
+        self._tab_scroll_frames = {
+            "Dashboard": self.tab_dash,
+            "Leaks": self.tab_leak,
+            "OCR": self.tab_ocr,
+            "AI / GTO": self.tab_ai,
+            "Settings": self.tab_settings,
+        }
+        self._tab_resize_job = None
 
         self._build_dashboard()
         self._build_hands_tab()
@@ -5031,9 +5152,9 @@ class PokerApp(ctk.CTk):
 
         # Dynamically rename tabs when window width changes to avoid text clipping
         _TAB_BREAK = 920
-        self._tabs_are_short = False
-        def _tabview_configure(event):
-            want_short = event.width < _TAB_BREAK
+        self._tabs_are_short = None
+        def _apply_tab_labels(width):
+            want_short = width < _TAB_BREAK
             if want_short == self._tabs_are_short:
                 return
             self._tabs_are_short = want_short
@@ -5044,6 +5165,16 @@ class PokerApp(ctk.CTk):
                     btn.configure(text=lbl)
             except Exception:
                 pass
+
+        def _tabview_configure(event):
+            if event.widget is not self:
+                return
+            if self._tab_resize_job is not None:
+                try:
+                    self.after_cancel(self._tab_resize_job)
+                except Exception:
+                    pass
+            self._tab_resize_job = self.after(200, lambda w=event.width: _apply_tab_labels(w))
         # Bind on the root window, not CTkTabview (CTkTabview.bind raises NotImplementedError)
         self.bind("<Configure>", _tabview_configure, add="+")
 
@@ -5204,6 +5335,12 @@ class PokerApp(ctk.CTk):
             text.configure(xscrollcommand=xscroll.set)
 
         text.pack(side="left", fill="both", expand=True)
+
+        def _on_text_wheel(event, txt=text):
+            txt.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        text.bind("<MouseWheel>", _on_text_wheel, add="+")
         return container, text
 
     def _build_dashboard(self):
@@ -5593,6 +5730,7 @@ class PokerApp(ctk.CTk):
         )
         self.hand_sel_count_label.pack(side="left", padx=8)
 
+        self._action_button(sel_frame, "View", self._view_selected_hand, tone="accent", width=72, bold=True).pack(side="left", padx=4)
         self._action_button(sel_frame, "Compare", self._compare_selected, tone="accent", width=100, bold=True).pack(side="left", padx=4)
         self._action_button(sel_frame, "Copy", self._copy_selected_hands, width=84).pack(side="left", padx=4)
         self._action_button(sel_frame, "Tag", self._tag_selected_hands, width=70).pack(side="left", padx=4)
@@ -5623,9 +5761,11 @@ class PokerApp(ctk.CTk):
             cursor="arrow",
             selectbackground=self.theme["select_bg"],
             wrap="none",
-            state="disabled",
+            exportselection=False,
         )
         self.hands_text.pack(fill="both", expand=True, side="left")
+        self.hands_text.bind("<Key>", lambda _e: "break")
+        self.hands_text.bind("<MouseWheel>", self._on_hands_mousewheel)
         hands_scrollbar = tk.Scrollbar(
             hand_list_container,
             command=self.hands_text.yview,
@@ -5787,6 +5927,29 @@ class PokerApp(ctk.CTk):
         ctk.CTkLabel(top, text="Leak Analysis", text_color=self.theme["gold"], font=_F_HEADER).pack(pady=8)
 
         self.leak_stats_frame = self._panel(tab)
+        self._leak_stat_cards = {}
+        stat_names = ["VPIP", "PFR", "AF", "WTSD", "W$SD", "C-Bet"]
+        for i, name in enumerate(stat_names):
+            frame = ctk.CTkFrame(
+                self.leak_stats_frame,
+                fg_color=self.theme["bg_card"],
+                corner_radius=8,
+                width=140,
+                height=70,
+                border_width=1,
+                border_color=self.theme["border"],
+            )
+            frame.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
+            frame.grid_propagate(False)
+            self.leak_stats_frame.grid_columnconfigure(i, weight=1)
+            ctk.CTkLabel(
+                frame, text=name, text_color=self.theme["text_dim"], font=_F_DATA_MD,
+            ).pack(pady=(6, 0))
+            val_lbl = ctk.CTkLabel(
+                frame, text="—", text_color=self.theme["text"], font=("Consolas", 18, "bold"),
+            )
+            val_lbl.pack()
+            self._leak_stat_cards[name] = val_lbl
 
         self.leak_alerts_frame = self._panel(tab)
         self._section_label(self.leak_alerts_frame, "Alerts").pack(anchor="w", padx=8, pady=4)
@@ -6912,20 +7075,36 @@ class PokerApp(ctk.CTk):
 
     def _do_initial_scan(self):
         new_count, file_count = self.importer.full_scan()
+        reparsed = self.importer.reparse_hands_missing_hero()
         total_hands = len(self.importer.get_hands())
-        self.after(0, lambda: self._set_status(
-            f"Scan: {new_count} new from {file_count} files | {total_hands} total hands"))
+        status = f"Scan: {new_count} new from {file_count} files | {total_hands} total hands"
+        if reparsed:
+            status += f" | reparsed {reparsed}"
+        self.after(0, lambda: self._set_status(status))
         self.after(0, self._post_scan)
         if self.settings.get("auto_refresh", True):
             self.importer.start_watcher(callback=self._watcher_callback)
 
     def _watcher_callback(self, new_count, file_count):
-        self.after(0, self._post_scan)
+        if new_count:
+            self.after(0, self._post_scan)
 
     def _post_scan(self):
         self._post_scan_generation += 1
         generation = self._post_scan_generation
-        self._set_status("Refreshing imported hands...")
+        if self._post_scan_debounce_job is not None:
+            try:
+                self.after_cancel(self._post_scan_debounce_job)
+            except Exception:
+                pass
+        self._post_scan_debounce_job = self.after(
+            500, lambda g=generation: self._start_post_scan_bg(g)
+        )
+
+    def _start_post_scan_bg(self, generation):
+        self._post_scan_debounce_job = None
+        if generation != self._post_scan_generation:
+            return
         threading.Thread(target=self._post_scan_bg, args=(generation,), daemon=True).start()
 
     def _post_scan_bg(self, generation):
@@ -6940,10 +7119,17 @@ class PokerApp(ctk.CTk):
         self._last_hands_snapshot = hands
         self.current_stats = stats
         self._set_status(status_text)
-        self._update_dashboard_with_hands(hands)
+        dash_fp = (
+            stats.get("total_hands"),
+            stats.get("vpip"),
+            stats.get("pfr"),
+            len(hands),
+        )
+        if dash_fp != self._dashboard_fingerprint:
+            self._dashboard_fingerprint = dash_fp
+            self._update_dashboard_with_hands(hands)
         self._refresh_hands_list_with_data(hands)
         self._update_leak_tab()
-        # Defer heavy HUD computation to background thread
         threading.Thread(target=self._compute_players_bg, daemon=True).start()
 
     def _manual_refresh(self):
@@ -6992,15 +7178,19 @@ class PokerApp(ctk.CTk):
 
         total_won = sum(d["won"] for d in s.get("by_site", {}).values())
         total_lost = sum(d["lost"] for d in s.get("by_site", {}).values())
-        self.dash_cards["Won"].configure(text=f"+{total_won:.0f}")
-        self.dash_cards["Lost"].configure(text=f"-{total_lost:.0f}")
+        self.dash_cards["Won"].configure(text=f"+${total_won:.2f}")
+        self.dash_cards["Lost"].configure(text=f"-${total_lost:.2f}")
 
         self.dash_site_text.configure(state="normal")
         self.dash_site_text.delete("1.0", "end")
         for site, sd in s.get("by_site", {}).items():
+            chip_note = ""
+            if sd.get("chip_net"):
+                chip_note = f"  Chips {sd['chip_net']:+,.0f}"
             self.dash_site_text.insert(
                 "end",
-                f"  {site:10s} {sd['total']:4d}h  VPIP {sd['vpip']:>2}%  PFR {sd['pfr']:>2}%  Net {sd['net']:+.2f}\n",
+                f"  {site:10s} {sd['total']:4d}h  VPIP {sd['vpip']:>2}%  PFR {sd['pfr']:>2}%  "
+                f"Cash ${sd['net']:+.2f}{chip_note}\n",
             )
         self.dash_site_text.configure(state="disabled")
 
@@ -7009,14 +7199,14 @@ class PokerApp(ctk.CTk):
         recent = sorted(hands, key=lambda h: h.date or datetime.min, reverse=True)[:10]
         if recent:
             latest = recent[0]
-            latest_result = f"{latest.hero_won:+.0f}"
+            latest_result = format_hero_result(latest)
             latest_cards = latest.hero_cards or "--"
             self.dash_command_feed_var.set(f"{latest.site}  {latest_cards}  {latest.hero_position or '--'}  {latest_result}")
         else:
             self.dash_command_feed_var.set("Waiting for imported hands")
         for h in recent:
             dt = h.date.strftime("%m/%d %H:%M") if h.date else "?"
-            result_str = f"+{h.hero_won:.0f}" if h.hero_won >= 0 else f"{h.hero_won:.0f}"
+            result_str = format_hero_result(h)
             self.dash_recent.insert(
                 "end",
                 f"  {dt}  {h.site:10s}  {h.hero_cards:8s}  {h.hero_position:3s}  {result_str}\n",
@@ -7109,16 +7299,48 @@ class PokerApp(ctk.CTk):
         self.dash_canvas.draw()
 
     # ── Hands tab ─────────────────────────────────────────────────────────
+    def _on_hands_mousewheel(self, event):
+        self.hands_text.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _hands_list_signature(self, hands):
+        if not hands:
+            return (0, self.hand_site_var.get(), self.hand_result_var.get(), self.hand_sort_var.get())
+        sample = hands[:3]
+        return (
+            len(hands),
+            self.hand_site_var.get(),
+            self.hand_result_var.get(),
+            self.hand_sort_var.get(),
+            tuple(h.hand_id for h in sample),
+            hands[0].hand_id if hands else None,
+        )
+
     def _refresh_hands_list(self):
+        self._hands_list_fingerprint = None
         self._refresh_hands_list_with_data(self.importer.get_hands())
 
     def _refresh_hands_list_with_data(self, hands):
-        self.hands_text.configure(state="normal")
+        filtered = self._apply_filters(hands)
+        signature = self._hands_list_signature(filtered)
+        if signature == self._hands_list_fingerprint and self._hand_objects:
+            self._update_hand_row_highlights()
+            self.hand_count_label.configure(
+                text=f"{len(filtered)} hands ({min(len(filtered), 500)} shown)"
+            )
+            return
+        self._hands_list_fingerprint = signature
+
+        yview = self.hands_text.yview()
+        preserved_selection = set(self._selected_hand_ids)
+        preserved_active = self._hands_active_hand_id
+
         self.hands_text.delete("1.0", "end")
         self._hand_objects.clear()
-        self._selected_hand_ids = set()
-
-        filtered = self._apply_filters(hands)
+        self._hand_tag_by_id.clear()
+        self._selected_hand_ids = {hid for hid in preserved_selection if hid}
+        if preserved_active:
+            self._hands_active_hand_id = preserved_active
 
         sort_choice = self.hand_sort_var.get()
         if "Date \u2193" in sort_choice:
@@ -7138,7 +7360,7 @@ class PokerApp(ctk.CTk):
             self._hand_objects[h.hand_id] = h
             dt = h.date.strftime("%m/%d %H:%M") if h.date else "?"
             game = "Trn" if h.is_tournament else "Cash"
-            result = f"+{h.hero_won:.0f}" if h.hero_won >= 0 else f"{h.hero_won:.0f}"
+            result = format_hero_result(h)
             pot_str = f"{h.pot:.0f}" if h.pot else ""
             ev_diff = self.ev_calculator.calc_ev_diff(h, self.settings)
             ev_str = f"+{ev_diff:.0f}" if ev_diff >= 0 else f"{ev_diff:.0f}"
@@ -7147,11 +7369,23 @@ class PokerApp(ctk.CTk):
             if tags is None:
                 tags = self.db.get_tags(h.hand_id)
             tag_str = f" [{','.join(tags)}]" if tags else ""
-            line = f"  {dt:14s} {h.site:10s} {game:5s} {h.hero_cards:8s} {h.hero_position:4s} {result:>8s} {pot_str:>7s} {ev_str:>7s}{tag_str}\n"
+            cards = (h.hero_cards or "--").strip()
+            if len(cards) > 8:
+                cards = cards[:8]
+            cards = cards.ljust(8)
+            line = f"  {dt:14s} {h.site:10s} {game:5s} {cards:8s} {h.hero_position:4s} {result:>8s} {pot_str:>7s} {ev_str:>7s}{tag_str}\n"
             tag_name = f"hand_{i}"
             self.hands_text.insert("end", line, (tag_name,))
+            self._hand_tag_by_id[h.hand_id] = tag_name
 
-            self.hands_text.tag_bind(tag_name, "<Button-1>", lambda e, hand=h: self._show_hand_detail(hand))
+            self.hands_text.tag_bind(
+                tag_name, "<Button-1>",
+                lambda e, hand=h: self._on_hand_row_click(e, hand),
+            )
+            self.hands_text.tag_bind(
+                tag_name, "<Double-Button-1>",
+                lambda e, hand=h: self._on_hand_row_double_click(e, hand),
+            )
             if h.hero_won > 0:
                 self.hands_text.tag_configure(tag_name, foreground=self.theme["row_win"])
             elif h.hero_won < 0:
@@ -7162,9 +7396,13 @@ class PokerApp(ctk.CTk):
         if not filtered:
             self.hands_text.insert("end", "  No hands match filters")
 
-        self.hands_text.configure(state="disabled")
         self.hand_count_label.configure(text=f"{len(filtered)} hands ({min(len(filtered), 500)} shown)")
+        self._update_hand_row_highlights()
         self._update_selection_count()
+        try:
+            self.hands_text.yview_moveto(yview[0])
+        except Exception:
+            pass
 
     def _apply_filters(self, hands):
         """Apply all active filters to hands list."""
@@ -7537,6 +7775,79 @@ class PokerApp(ctk.CTk):
             command=_close,
         ).pack(pady=(4, 10))
 
+    def _on_hand_row_click(self, event, hand):
+        """Defer single-click selection so double-click can still fire."""
+        ctrl = bool(event.state & 0x0004)
+        if self._hand_click_after_id is not None:
+            try:
+                self.after_cancel(self._hand_click_after_id)
+            except Exception:
+                pass
+        self._hand_click_after_id = self.after(
+            220, lambda h=hand, c=ctrl: self._apply_hand_row_select(h, c)
+        )
+
+    def _on_hand_row_double_click(self, event, hand):
+        """Double-click opens detail panel and hand replayer."""
+        if self._hand_click_after_id is not None:
+            try:
+                self.after_cancel(self._hand_click_after_id)
+            except Exception:
+                pass
+            self._hand_click_after_id = None
+        self._show_hand_detail(hand, open_replayer=True)
+        return "break"
+
+    def _apply_hand_row_select(self, hand, ctrl=False):
+        """Single-click selection only — no detail panel or replayer."""
+        self._hand_click_after_id = None
+        hid = hand.hand_id
+        if ctrl:
+            if hid in self._selected_hand_ids:
+                self._selected_hand_ids.discard(hid)
+            else:
+                self._selected_hand_ids.add(hid)
+        else:
+            self._selected_hand_ids = {hid}
+        self._hands_active_hand_id = hid
+        self.select_all_var.set(
+            len(self._selected_hand_ids) == len(self._hand_objects) and bool(self._hand_objects)
+        )
+        self._update_hand_row_highlights()
+        self._update_selection_count()
+
+    def _update_hand_row_highlights(self):
+        t = self.theme
+        active_bg = _blend(t["bg_accent"], t["bg_input"], 0.45)
+        selected_bg = _blend(t["green"], t["bg_input"], 0.72)
+        for hid, hand in self._hand_objects.items():
+            tag_name = self._hand_tag_by_id.get(hid)
+            if not tag_name:
+                continue
+            if hid == self._hands_active_hand_id:
+                fg = t["text"]
+                bg = active_bg
+            elif hid in self._selected_hand_ids:
+                fg = t["text"]
+                bg = selected_bg
+            elif hand.hero_won > 0:
+                fg = t["row_win"]
+                bg = t["bg_input"]
+            elif hand.hero_won < 0:
+                fg = t["row_loss"]
+                bg = t["bg_input"]
+            else:
+                fg = t["row_even"]
+                bg = t["bg_input"]
+            self.hands_text.tag_configure(tag_name, foreground=fg, background=bg)
+
+    def _view_selected_hand(self):
+        selected = self._get_selected_hands()
+        if not selected:
+            self._set_status("Select a hand first, then click View")
+            return
+        self._show_hand_detail(selected[-1], open_replayer=True)
+
     def _update_selection_count(self):
         count = len(self._selected_hand_ids)
         self.hand_sel_count_label.configure(text=f"{count} selected")
@@ -7547,6 +7858,7 @@ class PokerApp(ctk.CTk):
             self._selected_hand_ids = set(self._hand_objects.keys())
         else:
             self._selected_hand_ids.clear()
+        self._update_hand_row_highlights()
         self._update_selection_count()
 
     def _get_selected_hands(self):
@@ -7577,7 +7889,7 @@ class PokerApp(ctk.CTk):
         total_result = 0.0
         for i, h in enumerate(selected, 1):
             dt = h.date.strftime("%m/%d %H:%M") if h.date else "?"
-            res = f"+{h.hero_won:.0f}" if h.hero_won >= 0 else f"{h.hero_won:.0f}"
+            res = format_hero_result(h)
             total_result += h.hero_won
             self.hand_detail_text.insert("end",
                 f"  {i:<3d} {h.site:10s} {h.hero_cards:10s} {h.hero_position:4s} "
@@ -7633,8 +7945,13 @@ class PokerApp(ctk.CTk):
         self.clipboard_append(full)
         self._set_status(f"Copied {len(selected)} hands to clipboard!")
 
-    def _show_hand_detail(self, hand):
-        """Open a lightweight native Toplevel window showing hand details."""
+    def _show_hand_detail(self, hand, popup=False, open_replayer=False):
+        """Show hand details in the embedded panel; optional popup and replayer."""
+        self._hands_active_hand_id = hand.hand_id
+        self._selected_hand_ids = {hand.hand_id}
+        self._update_hand_row_highlights()
+        self._update_selection_count()
+
         # Also update the embedded detail panel
         self.detail_title_label.configure(text="Details")
         self.hand_detail_text.configure(state="normal")
@@ -7642,12 +7959,17 @@ class PokerApp(ctk.CTk):
         ev_diff = self.ev_calculator.calc_ev_diff(hand, self.settings)
         strength = self.ev_calculator.get_hand_strength(hand.hero_cards)
         ev_str = f"+{ev_diff:.1f}" if ev_diff >= 0 else f"{ev_diff:.1f}"
+        cards_display = hand.hero_cards or "(unknown)"
+        board_display = " ".join(hand.board_cards or []) or "(none)"
+        self.hand_detail_text.insert("end", "\u2500\u2500 Hand Summary \u2500\u2500\n")
+        self.hand_detail_text.insert("end",
+            f"  Hole Cards: {cards_display}    Board: {board_display}\n")
         self.hand_detail_text.insert("end", "\u2500\u2500 EV Analysis \u2500\u2500\n")
         self.hand_detail_text.insert("end",
             f"  Hand Strength: {strength}/100 | EV Diff: {ev_str}\n")
         self.hand_detail_text.insert("end",
             f"  Position: {hand.hero_position} | Pot: {hand.pot:.0f} | "
-            f"Result: {hand.hero_won:+.0f}\n\n")
+            f"Result: {format_hero_result(hand)}\n\n")
         self.hand_detail_text.insert("end", hand.raw_text if hand.raw_text else "(no raw text)")
 
         # Show opponent types
@@ -7669,8 +7991,10 @@ class PokerApp(ctk.CTk):
         self.hand_detail_text.configure(state="disabled")
         self._refresh_detail_tag_strip(hand)
 
-        # Open a separate popup window
-        self._open_hand_popup(hand, ev_diff, strength)
+        if popup:
+            self._open_hand_popup(hand, ev_diff, strength)
+        if open_replayer:
+            HandReplayerWindow(self, hand, self.theme)
 
     def _open_hand_popup(self, hand, ev_diff, strength):
         """Lightweight native tkinter Toplevel for hand detail."""
@@ -7687,7 +8011,7 @@ class PokerApp(ctk.CTk):
         header.pack_propagate(False)
 
         dt = hand.date.strftime("%m/%d/%Y %H:%M") if hand.date else "?"
-        res = f"+{hand.hero_won:.0f}" if hand.hero_won >= 0 else f"{hand.hero_won:.0f}"
+        res = format_hero_result(hand)
         res_color = self.theme["green"] if hand.hero_won >= 0 else self.theme["red"]
         ev_str = f"+{ev_diff:.1f}" if ev_diff >= 0 else f"{ev_diff:.1f}"
 
@@ -8004,8 +8328,15 @@ class PokerApp(ctk.CTk):
         s = self.current_stats
         if not s:
             return
-        for widget in self.leak_stats_frame.winfo_children():
-            widget.destroy()
+        leak_fp = (
+            s.get("vpip"), s.get("pfr"), s.get("af"), s.get("wtsd"), s.get("wsd"), s.get("cbet"),
+            tuple((pos, tuple(pd.items())) for pos, pd in sorted(s.get("by_position", {}).items())),
+            tuple((site, tuple(sd.items())) for site, sd in sorted(s.get("by_site", {}).items())),
+            tuple(s.get("alerts", [])),
+        )
+        if leak_fp == self._leak_tab_fingerprint:
+            return
+        self._leak_tab_fingerprint = leak_fp
 
         stat_defs = [
             ("VPIP", f"{s['vpip']}%", self._stat_color(s["vpip"], 15, 22, 30)),
@@ -8015,15 +8346,10 @@ class PokerApp(ctk.CTk):
             ("W$SD", f"{s['wsd']}%", self.theme["green"] if s["wsd"] >= 50 else self.theme["yellow"] if s["wsd"] >= 45 else self.theme["red"]),
             ("C-Bet", f"{s['cbet']}%", self._stat_color(s["cbet"], 50, 70, 80)),
         ]
-        for i, (name, val, color) in enumerate(stat_defs):
-            frame = ctk.CTkFrame(self.leak_stats_frame, fg_color=self.theme["bg_card"],
-                                  corner_radius=8, width=140, height=70,
-                                  border_width=1, border_color=self.theme["border"])
-            frame.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
-            frame.grid_propagate(False)
-            self.leak_stats_frame.grid_columnconfigure(i, weight=1)
-            ctk.CTkLabel(frame, text=name, text_color=self.theme["text_dim"], font=_F_DATA_MD).pack(pady=(6, 0))
-            ctk.CTkLabel(frame, text=val, text_color=color, font=("Consolas", 18, "bold")).pack()
+        for name, val, color in stat_defs:
+            lbl = self._leak_stat_cards.get(name)
+            if lbl:
+                lbl.configure(text=val, text_color=color)
 
         self.leak_alerts_text.configure(state="normal")
         self.leak_alerts_text.delete("1.0", "end")
@@ -8046,9 +8372,14 @@ class PokerApp(ctk.CTk):
         self.leak_site_text.configure(state="normal")
         self.leak_site_text.delete("1.0", "end")
         for site, sd in s.get("by_site", {}).items():
-            self.leak_site_text.insert("end",
-                                        f"  {site}: {sd['total']} hands | VPIP {sd['vpip']}% | "
-                                        f"PFR {sd['pfr']}% | Net: {sd['net']:+.2f}\n")
+            chip_note = ""
+            if sd.get("chip_net"):
+                chip_note = f" | Chips {sd['chip_net']:+,.0f}"
+            self.leak_site_text.insert(
+                "end",
+                f"  {site}: {sd['total']} hands | VPIP {sd['vpip']}% | "
+                f"PFR {sd['pfr']}% | Cash ${sd['net']:+.2f}{chip_note}\n",
+            )
         self.leak_site_text.configure(state="disabled")
 
         self._update_leak_graphs()
@@ -8059,6 +8390,14 @@ class PokerApp(ctk.CTk):
             return
         t = self.theme
         s = self.current_stats
+        pos_stats = s.get("by_position", {}) if s else {}
+        graph_fp = tuple(
+            (pos, pd.get("vpip"), pd.get("pfr"))
+            for pos, pd in sorted(pos_stats.items())
+        )
+        if graph_fp == self._leak_graph_fingerprint:
+            return
+        self._leak_graph_fingerprint = graph_fp
         self.leak_fig.clear()
         self.leak_fig.patch.set_facecolor(t["graph_bg"])
 
@@ -8069,7 +8408,6 @@ class PokerApp(ctk.CTk):
         for spine in ax.spines.values():
             spine.set_color(t["graph_grid"])
 
-        pos_stats = s.get("by_position", {}) if s else {}
         if pos_stats:
             positions = list(pos_stats.keys())
             vpip_vals = [pos_stats[p].get("vpip", 0) for p in positions]

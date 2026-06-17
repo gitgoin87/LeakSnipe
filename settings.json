@@ -1,12 +1,33 @@
 {
   "hero_names": {
     "ACR": "",
-    "CoinPoker": "",
-    "BetACR": "",
-    "GGPoker": "",
+    "CoinPoker": "jdwalka",
+    "BetACR": "GBOSS101,JohnDaWalka",
+    "GGPoker": "JohnDaWalka",
     "ReplayPoker": ""
   },
-  "scan_dirs": [],
+  "scan_dirs": [
+    {
+      "path": "C:\\ACR Poker\\handHistory\\JohnDaWalka",
+      "site": "BetACR"
+    },
+    {
+      "path": "C:\\ACR Poker\\handHistory",
+      "site": "BetACR"
+    },
+    {
+      "path": "C:\\Users\\Giuli\\AppData\\Roaming\\CoinPoker\\logs",
+      "site": "CoinPoker"
+    },
+    {
+      "path": "C:\\ACR Poker\\TournamentSummary\\JohnDaWalka",
+      "site": "BetACR"
+    },
+    {
+      "path": "C:\\ACR Poker\\handHistory\\GBOSS101",
+      "site": "BetACR"
+    }
+  ],
   "auto_refresh": true,
   "refresh_interval": 5,
   "theme": "Slate Blue",
@@ -22,5 +43,6 @@
   "hud_site_profiles": {},
   "db_path": "poker_hands.db",
   "dh2_auto_sync": false,
-  "dh2_sync_interval": 5
+  "dh2_sync_interval": 5,
+  "ai_provider": "ollama"
 }

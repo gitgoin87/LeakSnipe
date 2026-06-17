@@ -35,12 +35,20 @@ class Hand:
         self.winners: List[Dict[str, Any]] = []
         self.hero_won: float = 0.0
         self.hero_position: str = ""
+        self.hero_player: str = ""
         self.raw_text: str = ""
         self.tags: List[str] = []
 
     def hero_name(self, settings: Dict[str, Any]) -> str:
         """Get hero player name from settings for this hand's site."""
-        return settings.get("hero_names", {}).get(self.site, "")
+        from utils import resolve_hand_hero_name
+        return resolve_hand_hero_name(
+            settings,
+            self.site,
+            players=self.players,
+            raw_text=self.raw_text,
+            hero_player=getattr(self, "hero_player", ""),
+        )
 
 
 class HandDatabase:
@@ -231,6 +239,204 @@ class HandDatabase:
             finally:
                 conn.close()
 
+    def reparse_hands_missing_hero(self, parser: "HandParser") -> int:
+        """Re-parse stored raw text for hands missing hero cards or position."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT hand_id, site, raw_text, source_file FROM hands "
+                    "WHERE raw_text != '' AND (hero_cards IS NULL OR hero_cards = '' "
+                    "OR hero_position IS NULL OR hero_position = '' OR hero_position = '?')"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        updated = 0
+        for row in rows:
+            site = row["site"] or "BetACR"
+            hand = parser._parse_single(row["raw_text"], site)
+            if hand and hand.hand_id:
+                self.save_hand(hand, source_file=row["source_file"] or "")
+                updated += 1
+        return updated
+
+    @staticmethod
+    def _hydrate_hand(
+        row: sqlite3.Row,
+        players_by_hand: Dict,
+        actions_by_hand: Dict,
+        winners_by_hand: Dict,
+        tags_by_hand: Dict,
+    ) -> Hand:
+        """Build a Hand object from a hands row and related grouped rows."""
+        h = Hand()
+        h.hand_id = row["hand_id"]
+        h.site = row["site"] or ""
+        if row["date"]:
+            try:
+                h.date = datetime.fromisoformat(row["date"])
+            except (ValueError, TypeError):
+                h.date = datetime.now()
+        else:
+            h.date = datetime.now()
+        h.game_type = row["game_type"] or ""
+        h.is_tournament = bool(row["is_tournament"])
+        h.tournament_id = row["tournament_id"] or ""
+        h.buy_in = row["buy_in"] or ""
+        h.table_name = row["table_name"] or ""
+        h.max_seats = row["max_seats"] or 0
+        h.button_seat = row["button_seat"] or 0
+        h.hero_cards = row["hero_cards"] or ""
+        h.board_cards = row["board_cards"].split() if row["board_cards"] else []
+        h.pot = row["pot"] or 0.0
+        h.rake = row["rake"] or 0.0
+        h.hero_won = row["hero_won"] or 0.0
+        h.hero_position = row["hero_position"] or ""
+        h.raw_text = row["raw_text"] or ""
+        h.tags = list(tags_by_hand.get(h.hand_id, []))
+
+        for pr in players_by_hand.get(h.hand_id, []):
+            h.players[pr["seat"]] = {
+                "name": pr["name"],
+                "stack": pr["stack"],
+                "is_hero": bool(pr["is_hero"]),
+            }
+            if pr["is_hero"]:
+                h.hero_player = pr["name"]
+
+        streets_map = OrderedDict()
+        for ar in actions_by_hand.get(h.hand_id, []):
+            sname = ar["street"]
+            if sname not in streets_map:
+                streets_map[sname] = {"name": sname, "cards": [], "actions": []}
+            streets_map[sname]["actions"].append({
+                "player": ar["player"],
+                "action": ar["action"],
+                "amount": ar["amount"],
+            })
+        bc = h.board_cards
+        _street_order = ["Preflop", "Flop", "Turn", "River"]
+        if len(bc) >= 3:
+            if "Flop" not in streets_map:
+                streets_map["Flop"] = {"name": "Flop", "cards": [], "actions": []}
+            streets_map["Flop"]["cards"] = bc[:3]
+        if len(bc) >= 4:
+            if "Turn" not in streets_map:
+                streets_map["Turn"] = {"name": "Turn", "cards": [], "actions": []}
+            streets_map["Turn"]["cards"] = [bc[3]]
+        if len(bc) >= 5:
+            if "River" not in streets_map:
+                streets_map["River"] = {"name": "River", "cards": [], "actions": []}
+            streets_map["River"]["cards"] = [bc[4]]
+        sorted_map = OrderedDict()
+        for _sn in _street_order:
+            if _sn in streets_map:
+                sorted_map[_sn] = streets_map[_sn]
+        for _sn in streets_map:
+            if _sn not in sorted_map:
+                sorted_map[_sn] = streets_map[_sn]
+        h.streets = list(sorted_map.values())
+
+        h.winners = [
+            {"name": wr["player_name"], "amount": wr["amount"]}
+            for wr in winners_by_hand.get(h.hand_id, [])
+        ]
+        return h
+
+    def _load_related_for_ids(self, c: sqlite3.Cursor, hand_ids: List[str]):
+        """Load players, actions, winners, tags grouped by hand_id for given IDs."""
+        if not hand_ids:
+            return {}, {}, {}, defaultdict(list)
+        placeholders = ",".join("?" * len(hand_ids))
+        players_by_hand = self._group_rows_by_hand(
+            c.execute(
+                f"SELECT hand_id, seat, name, stack, is_hero FROM players "
+                f"WHERE hand_id IN ({placeholders}) ORDER BY hand_id, seat",
+                hand_ids,
+            ).fetchall()
+        )
+        actions_by_hand = self._group_rows_by_hand(
+            c.execute(
+                f"SELECT hand_id, street, player, action, amount, sequence "
+                f"FROM actions WHERE hand_id IN ({placeholders}) ORDER BY hand_id, sequence",
+                hand_ids,
+            ).fetchall()
+        )
+        winners_by_hand = self._group_rows_by_hand(
+            c.execute(
+                f"SELECT hand_id, player_name, amount FROM winners "
+                f"WHERE hand_id IN ({placeholders}) ORDER BY hand_id",
+                hand_ids,
+            ).fetchall()
+        )
+        tags_by_hand: Dict[str, List[str]] = defaultdict(list)
+        for tag_row in c.execute(
+            f"SELECT hand_id, tag FROM hand_tags WHERE hand_id IN ({placeholders}) "
+            f"ORDER BY hand_id, tag",
+            hand_ids,
+        ).fetchall():
+            tags_by_hand[tag_row["hand_id"]].append(tag_row["tag"])
+        return players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
+
+    def count_hands(self) -> int:
+        """Total number of hands in the database."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM hands").fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
+
+    def get_hand_by_id(self, hand_id: str) -> Optional[Hand]:
+        """Load a single hand by ID (fast path for replayer/detail)."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                row = c.execute(
+                    "SELECT * FROM hands WHERE hand_id = ?", (hand_id,)
+                ).fetchone()
+                if not row:
+                    return None
+                players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
+                    self._load_related_for_ids(c, [hand_id])
+                )
+                return self._hydrate_hand(
+                    row, players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
+                )
+            finally:
+                conn.close()
+
+    def get_hands_page(self, limit: int, offset: int = 0) -> List[Hand]:
+        """Load a page of hands ordered by date (does not load entire DB)."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                rows = c.execute(
+                    "SELECT * FROM hands ORDER BY date DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+                if not rows:
+                    return []
+                hand_ids = [row["hand_id"] for row in rows]
+                players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
+                    self._load_related_for_ids(c, hand_ids)
+                )
+                return [
+                    self._hydrate_hand(
+                        row, players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
+                    )
+                    for row in rows
+                ]
+            finally:
+                conn.close()
+
     def get_all_hands(self) -> List[Hand]:
         """Retrieve all hands from the database."""
         with self.lock:
@@ -242,105 +448,17 @@ class HandDatabase:
                 if not rows:
                     return []
 
-                players_by_hand = self._group_rows_by_hand(
-                    c.execute(
-                        "SELECT hand_id, seat, name, stack, is_hero FROM players ORDER BY hand_id, seat"
-                    ).fetchall()
+                hand_ids = [row["hand_id"] for row in rows]
+                players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand = (
+                    self._load_related_for_ids(c, hand_ids)
                 )
-                actions_by_hand = self._group_rows_by_hand(
-                    c.execute(
-                        "SELECT hand_id, street, player, action, amount, sequence "
-                        "FROM actions ORDER BY hand_id, sequence"
-                    ).fetchall()
-                )
-                winners_by_hand = self._group_rows_by_hand(
-                    c.execute(
-                        "SELECT hand_id, player_name, amount FROM winners ORDER BY hand_id"
-                    ).fetchall()
-                )
-                tags_by_hand = defaultdict(list)
-                for tag_row in c.execute(
-                    "SELECT hand_id, tag FROM hand_tags ORDER BY hand_id, tag"
-                ).fetchall():
-                    tags_by_hand[tag_row["hand_id"]].append(tag_row["tag"])
 
-                hands = []
-                for row in rows:
-                    h = Hand()
-                    h.hand_id = row["hand_id"]
-                    h.site = row["site"] or ""
-                    if row["date"]:
-                        try:
-                            h.date = datetime.fromisoformat(row["date"])
-                        except (ValueError, TypeError):
-                            h.date = datetime.now()
-                    else:
-                        h.date = datetime.now()
-                    h.game_type = row["game_type"] or ""
-                    h.is_tournament = bool(row["is_tournament"])
-                    h.tournament_id = row["tournament_id"] or ""
-                    h.buy_in = row["buy_in"] or ""
-                    h.table_name = row["table_name"] or ""
-                    h.max_seats = row["max_seats"] or 0
-                    h.button_seat = row["button_seat"] or 0
-                    h.hero_cards = row["hero_cards"] or ""
-                    h.board_cards = row["board_cards"].split() if row["board_cards"] else []
-                    h.pot = row["pot"] or 0.0
-                    h.rake = row["rake"] or 0.0
-                    h.hero_won = row["hero_won"] or 0.0
-                    h.hero_position = row["hero_position"] or ""
-                    h.raw_text = row["raw_text"] or ""
-                    h.tags = list(tags_by_hand.get(h.hand_id, []))
-
-                    players_rows = players_by_hand.get(h.hand_id, [])
-                    for pr in players_rows:
-                        h.players[pr["seat"]] = {
-                            "name": pr["name"],
-                            "stack": pr["stack"],
-                            "is_hero": bool(pr["is_hero"]),
-                        }
-
-                    streets_map = OrderedDict()
-                    for ar in actions_by_hand.get(h.hand_id, []):
-                        sname = ar["street"]
-                        if sname not in streets_map:
-                            streets_map[sname] = {"name": sname, "cards": [], "actions": []}
-                        streets_map[sname]["actions"].append({
-                            "player": ar["player"],
-                            "action": ar["action"],
-                            "amount": ar["amount"],
-                        })
-                    # Inject board cards if available
-                    bc = h.board_cards
-                    _street_order = ["Preflop", "Flop", "Turn", "River"]
-                    if len(bc) >= 3:
-                        if "Flop" not in streets_map:
-                            streets_map["Flop"] = {"name": "Flop", "cards": [], "actions": []}
-                        streets_map["Flop"]["cards"] = bc[:3]
-                    if len(bc) >= 4:
-                        if "Turn" not in streets_map:
-                            streets_map["Turn"] = {"name": "Turn", "cards": [], "actions": []}
-                        streets_map["Turn"]["cards"] = [bc[3]]
-                    if len(bc) >= 5:
-                        if "River" not in streets_map:
-                            streets_map["River"] = {"name": "River", "cards": [], "actions": []}
-                        streets_map["River"]["cards"] = [bc[4]]
-                    # Re-sort streets in natural poker order
-                    sorted_map = OrderedDict()
-                    for _sn in _street_order:
-                        if _sn in streets_map:
-                            sorted_map[_sn] = streets_map[_sn]
-                    for _sn in streets_map:
-                        if _sn not in sorted_map:
-                            sorted_map[_sn] = streets_map[_sn]
-                    h.streets = list(sorted_map.values())
-
-                    winner_rows = winners_by_hand.get(h.hand_id, [])
-                    h.winners = [{"name": wr["player_name"], "amount": wr["amount"]}
-                                 for wr in winner_rows]
-
-                    hands.append(h)
-                return hands
+                return [
+                    self._hydrate_hand(
+                        row, players_by_hand, actions_by_hand, winners_by_hand, tags_by_hand
+                    )
+                    for row in rows
+                ]
             finally:
                 conn.close()
 

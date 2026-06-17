@@ -1,0 +1,12 @@
+# LeakSnipe sidecar (sidecar/server.py) + engine imports
+# Install from REPO ROOT: pip install -r sidecar/requirements.txt
+
+# HTTP API
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
+
+# AI (ai_processor.py) — at least one of OpenAI / Gemini keys in .env
+openai>=1.0.0
+google-generativeai>=0.8.0
+anthropic>=0.39.0

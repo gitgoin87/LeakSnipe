@@ -24,7 +24,8 @@ class LeakEngine:
             "cbet_opportunities": 0, "cbet_made": 0,
             "by_position": defaultdict(lambda: {"total": 0, "vpip": 0, "pfr": 0}),
             "by_site": defaultdict(lambda: {
-                "total": 0, "vpip": 0, "pfr": 0, "won": 0.0, "lost": 0.0
+                "total": 0, "vpip": 0, "pfr": 0,
+                "won": 0.0, "lost": 0.0, "chip_net": 0.0,
             }),
             "biggest_wins": [], "biggest_losses": [],
         }
@@ -37,7 +38,9 @@ class LeakEngine:
             pos = h.hero_position
             stats["by_position"][pos]["total"] += 1
 
-            if h.hero_won > 0:
+            if h.is_tournament:
+                stats["by_site"][h.site]["chip_net"] += h.hero_won
+            elif h.hero_won > 0:
                 stats["by_site"][h.site]["won"] += h.hero_won
             else:
                 stats["by_site"][h.site]["lost"] += abs(h.hero_won)
@@ -141,6 +144,7 @@ class LeakEngine:
                 "pfr": round(100 * d["pfr"] / st, 1),
                 "won": round(d["won"], 2),
                 "lost": round(d["lost"], 2),
+                "chip_net": round(d.get("chip_net", 0.0), 0),
                 "net": round(d["won"] - d["lost"], 2),
             }
         result["alerts"] = self._generate_alerts(result)

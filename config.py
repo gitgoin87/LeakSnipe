@@ -24,7 +24,7 @@ def _load_env_file(path: str = ENV_PATH) -> Dict[str, str]:
         return env_vars
     
     try:
-        with open(path, 'r') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 # Skip comments and empty lines
@@ -33,11 +33,47 @@ def _load_env_file(path: str = ENV_PATH) -> Dict[str, str]:
                 # Parse KEY=VALUE
                 if '=' in line:
                     key, value = line.split('=', 1)
-                    env_vars[key.strip()] = value.strip()
+                    key = key.strip()
+                    value = value.strip()
+                    if (value.startswith('"') and value.endswith('"')) or (
+                        value.startswith("'") and value.endswith("'")
+                    ):
+                        value = value[1:-1]
+                    if key:
+                        env_vars[key] = value
     except Exception as e:
         log.warning(f"Failed to load .env file: {e}")
     
     return env_vars
+
+
+def bootstrap_env(path: Optional[str] = None, *, reload_file: bool = False) -> str:
+    """
+    Load repo-root .env into os.environ for child modules that read os.environ directly.
+    Does not override variables already set in the process environment.
+    """
+    env_path = path or ENV_PATH
+    if reload_file and hasattr(_get_env, "_env_cache"):
+        delattr(_get_env, "_env_cache")
+
+    for key, value in _load_env_file(env_path).items():
+        if value and key not in os.environ:
+            os.environ[key] = value
+
+    if hasattr(_get_env, "_env_cache"):
+        delattr(_get_env, "_env_cache")
+
+    return env_path
+
+
+def env_keys_detected() -> Dict[str, bool]:
+    """Return which API key env vars are set (values never exposed)."""
+    return {
+        "asi1": bool(get_api_key("asi1")),
+        "openai": bool(get_api_key("openai")),
+        "gemini": bool(get_api_key("gemini")),
+        "anthropic": bool(get_api_key("anthropic")),
+    }
 
 
 def _get_env(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -58,7 +94,7 @@ def get_api_key(provider: str) -> Optional[str]:
     Get API key for a provider securely from environment.
     
     Args:
-        provider: 'openai', 'gemini', 'anthropic', 'ollama'
+        provider: 'openai', 'gemini', 'anthropic', 'asi1'
     
     Returns:
         API key or None if not set
@@ -67,12 +103,17 @@ def get_api_key(provider: str) -> Optional[str]:
         'openai': 'OPENAI_API_KEY',
         'gemini': 'GEMINI_API_KEY',
         'anthropic': 'ANTHROPIC_API_KEY',
+        'asi1': 'ASI_ONE_API_KEY',
     }
-    
+
     if provider not in env_map:
         return None
-    
+
     key = _get_env(env_map[provider])
+    if provider == 'gemini' and not key:
+        key = _get_env('GOOGLE_API_KEY')
+    if provider == 'asi1' and not key:
+        key = _get_env('ASI1_API_KEY')
     if key and key != 'your-' + env_map[provider].lower() + '-here':
         return key
     return None
@@ -117,6 +158,7 @@ def load_settings() -> Dict[str, Any]:
         "hud_offset_x": 0,
         "hud_offset_y": 0,
         "hud_site_profiles": {},
+        "ai_provider": "ollama",
     }
     
     if not os.path.exists(SETTINGS_PATH):

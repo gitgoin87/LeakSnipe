@@ -51,6 +51,10 @@ class HandImporter:
         self.lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.last_scan_at: Optional[str] = None
+        self.last_scan_saved: int = 0
+        self.last_scan_files: int = 0
+        self.watcher_running: bool = False
 
     def update_settings(self, settings: Dict[str, Any]) -> None:
         """Update settings and recreate parser."""
@@ -128,7 +132,19 @@ class HandImporter:
                             saved += 1
                     files_count += 1
                     self.files_scanned.add(fpath)
+        with self.lock:
+            self.last_scan_at = datetime.now().isoformat()
+            self.last_scan_saved = saved
+            self.last_scan_files = files_count
+        if saved > 0:
+            logging.info("Import scan: saved %d new hand(s) from %d file(s)", saved, files_count)
         return saved, files_count
+
+    def reparse_hands_missing_hero(self) -> int:
+        """Backfill hero cards/stats for hands parsed with the wrong hero name."""
+        if not self.db:
+            return 0
+        return self.db.reparse_hands_missing_hero(self.parser)
 
     def import_files(self, file_paths: List[str]) -> Tuple[int, int]:
         """Import hands from explicit file paths. Returns (saved, files_count)."""
@@ -171,13 +187,50 @@ class HandImporter:
 
     def start_watcher(self, callback: Optional[Callable] = None) -> None:
         """Start background file watcher."""
+        if self._thread and self._thread.is_alive():
+            return
         self._stop.clear()
+        self.watcher_running = True
         self._thread = threading.Thread(target=self._watch_loop, args=(callback,), daemon=True)
         self._thread.start()
+        dirs = [e.get("path", "") for e in self.settings.get("scan_dirs", [])]
+        logging.info(
+            "Hand watcher started — polling every %ss, watching %d folder(s): %s",
+            self.settings.get("refresh_interval", 5),
+            len(dirs),
+            "; ".join(dirs[:5]) + ("…" if len(dirs) > 5 else ""),
+        )
 
     def stop_watcher(self) -> None:
         """Stop background file watcher."""
         self._stop.set()
+        self.watcher_running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def get_status(self) -> Dict[str, Any]:
+        """Watcher/import status for the UI."""
+        dirs = []
+        for entry in self.settings.get("scan_dirs", []):
+            path = os.path.normpath(str(entry.get("path", "")).strip())
+            dirs.append({
+                "path": path,
+                "site": str(entry.get("site", "")).strip(),
+                "exists": os.path.isdir(path),
+            })
+        alive = bool(self._thread and self._thread.is_alive())
+        return {
+            "watcher_running": alive and self.watcher_running,
+            "poll_interval_sec": self.settings.get("refresh_interval", 5),
+            "watch_folders": dirs,
+            "watch_folder_count": len(dirs),
+            "existing_folder_count": sum(1 for d in dirs if d["exists"]),
+            "last_scan_at": self.last_scan_at,
+            "last_scan_saved": self.last_scan_saved,
+            "last_scan_files": self.last_scan_files,
+            "files_tracked": len(self.file_signatures),
+        }
 
     def _watch_loop(self, callback: Optional[Callable]) -> None:
         """Background loop for watching files."""
@@ -228,14 +281,24 @@ def get_default_hh_paths() -> dict:
 
     candidates = {
         "CoinPoker": [
+            os.path.join(appdata, "CoinPoker", "logs"),
             os.path.join(appdata, "CoinPoker", "HandHistory"),
             os.path.join(localappdata, "CoinPoker", "HandHistory"),
         ],
         "BetACR": [
+            os.path.join(r"C:\ACR Poker\handHistory"),
+            os.path.join(localappdata, "WPN", "HandHistory"),
+            os.path.join(appdata, "WPN", "HandHistory"),
+            os.path.join(appdata, "Americas Cardroom", "HandHistory"),
+            os.path.join(localappdata, "Americas Cardroom", "HandHistory"),
             os.path.join(localappdata, "ACR", "HandHistory"),
+            os.path.join(documents, "ACR Poker", "HandHistory"),
+            os.path.join(documents, "Americas Cardroom", "HandHistory"),
             os.path.join(documents, "ACR", "HandHistory"),
             os.path.join(documents, "BetACR", "HandHistory"),
             os.path.join(appdata, "ACR", "HandHistory"),
+            os.path.join(appdata, "ACR Poker", "HandHistory"),
+            os.path.join(localappdata, "ACR Poker", "HandHistory"),
         ],
         "GGPoker": [
             os.path.join(localappdata, "GGPoker", "HandHistory"),
@@ -267,4 +330,72 @@ def get_default_hh_paths() -> dict:
                 result[site] = path
                 break
     return result
+
+
+def discover_scan_dirs(settings: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    """Find existing hand-history folders for all supported sites."""
+    settings = settings or {}
+    hero_names = settings.get("hero_names") or {}
+    betacr_hero = str(hero_names.get("BetACR") or "JohnDaWalka").strip()
+
+    candidates: List[Tuple[str, str]] = []
+
+    acr_hh_root = os.path.join(r"C:\ACR Poker", "handHistory")
+    if betacr_hero:
+        candidates.append((os.path.join(acr_hh_root, betacr_hero), "BetACR"))
+        candidates.append((os.path.join(r"C:\ACR Poker", "TournamentSummary", betacr_hero), "BetACR"))
+
+    if os.path.isdir(acr_hh_root):
+        for name in os.listdir(acr_hh_root):
+            subdir = os.path.join(acr_hh_root, name)
+            if os.path.isdir(subdir):
+                candidates.append((subdir, "BetACR"))
+
+    for site, path in get_default_hh_paths().items():
+        candidates.append((path, site))
+
+    extra_betacr = [
+        r"C:\HM3Archive\Winning Poker Network",
+        r"C:\Hand2Note4Hh\MyHandsArchive_H2N4\WinningPokerNetwork",
+    ]
+    for path in extra_betacr:
+        candidates.append((path, "BetACR"))
+
+    discovered: List[Dict[str, str]] = []
+    seen = set()
+    for raw_path, site in candidates:
+        path = os.path.normpath(str(raw_path).strip())
+        if not path or _is_drive_root(path) or not os.path.isdir(path):
+            continue
+        key = (site, os.path.normcase(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        discovered.append({"path": path, "site": site})
+    return discovered
+
+
+def merge_scan_dirs(
+    existing: Optional[List[Dict[str, str]]],
+    discovered: Optional[List[Dict[str, str]]],
+) -> List[Dict[str, str]]:
+    """Merge configured and auto-discovered scan directories, keeping only existing folders."""
+    merged: List[Dict[str, str]] = []
+    seen = set()
+    for entries in (existing or [], discovered or []):
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            path = os.path.normpath(str(entry.get("path", "")).strip())
+            site = str(entry.get("site", "")).strip() or "CoinPoker"
+            if not path or _is_drive_root(path) or not os.path.isdir(path):
+                continue
+            key = (site, os.path.normcase(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append({"path": path, "site": site})
+    return merged
 

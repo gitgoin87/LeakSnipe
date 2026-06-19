@@ -12,16 +12,19 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "LeakSnipe",
         "width": 1280,
         "height": 860,
         "minWidth": 1024,
-        "minHeight": 700
+        "minHeight": 700,
+        "backgroundColor": "#070b14"
       }
     ],
     "security": {
       "csp": null
-    }
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

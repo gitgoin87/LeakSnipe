@@ -3,6 +3,9 @@ import type { Dashboard } from "../lib/api";
 type StatsPanelProps = {
   dashboard: Dashboard | null;
   loading?: boolean;
+  warming?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
 };
 
 function alertClass(level: string) {
@@ -13,13 +16,77 @@ function alertClass(level: string) {
 
 const POSITION_ORDER = ["EP", "MP", "CO", "BTN", "SB", "BB"];
 
-export function StatsPanel({ dashboard, loading }: StatsPanelProps) {
-  if (loading || !dashboard) {
+function StatsUnavailable({
+  title,
+  message,
+  onRetry,
+}: {
+  title: string;
+  message: string;
+  onRetry?: () => void;
+}) {
+  return (
+    <div className="placeholder-card stats-error-card">
+      <strong>{title}</strong>
+      <p className="stats-error-message">{message}</p>
+      {onRetry ? (
+        <button type="button" className="ghost-btn small" onClick={onRetry}>
+          Retry
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+export function StatsPanel({ dashboard, loading, warming, error, onRetry }: StatsPanelProps) {
+  if (loading) {
     return <div className="placeholder-card">Loading leak analysis…</div>;
+  }
+
+  if (error && !dashboard) {
+    return (
+      <StatsUnavailable
+        title="Could not load stats"
+        message={error}
+        onRetry={onRetry}
+      />
+    );
+  }
+
+  if (!dashboard) {
+    return (
+      <StatsUnavailable
+        title="Stats unavailable"
+        message="Ensure the Python sidecar is running (port 8765), then click Retry or use Settings → Refresh."
+        onRetry={onRetry}
+      />
+    );
+  }
+
+  if (warming) {
+    return (
+      <div className="placeholder-card">
+        Computing leak analysis… ({dashboard.total_hands.toLocaleString()} hands in database)
+      </div>
+    );
   }
 
   return (
     <>
+      {error ? (
+        <div className="error-banner" role="alert">
+          Stats refresh failed: {error}
+          {onRetry ? (
+            <>
+              {" "}
+              <button type="button" className="ghost-btn small inline" onClick={onRetry}>
+                Retry
+              </button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="card-grid">
         <div className="stat-card accent">
           <div className="stat-label">VPIP</div>

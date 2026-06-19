@@ -3,25 +3,59 @@ import react from '@vitejs/plugin-react'
 import electron from 'vite-plugin-electron'
 import renderer from 'vite-plugin-electron-renderer'
 
+const electronExternals = [
+  'electron',
+  'better-sqlite3',
+  'get-windows',
+  'drizzle-orm',
+  'drizzle-orm/better-sqlite3',
+]
+
+function electronBuildOptions() {
+  return {
+    build: {
+      rollupOptions: {
+        external: electronExternals,
+        output: {
+          format: 'cjs' as const,
+        },
+      },
+    },
+  }
+}
+
 // https://vite.dev/config/
 export default defineConfig({
-  base: './', // Ensure relative paths for Electron
+  base: './',
   plugins: [
     react(),
     electron([
       {
-        // Main-Process entry file of the Electron App.
         entry: 'electron/main.ts',
+        vite: electronBuildOptions(),
       },
       {
         entry: 'electron/preload.ts',
+        vite: {
+          build: {
+            rollupOptions: {
+              external: ['electron'],
+              output: {
+                format: 'cjs' as const,
+              },
+            },
+          },
+        },
         onstart(options) {
-          // Notify the Renderer-Process to reload the page when the Preload-Scripts build is complete, 
-          // instead of restarting the entire Electron App.
           options.reload()
         },
       },
     ]),
-    renderer(),
+    renderer({
+      resolve: {
+        'better-sqlite3': { type: 'cjs' },
+        'get-windows': { type: 'cjs' },
+      },
+    }),
   ],
 })

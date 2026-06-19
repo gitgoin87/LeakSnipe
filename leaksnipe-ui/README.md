@@ -91,6 +91,12 @@ cd C:\Users\Giuli\Projects\LeakSnipe
 python sidecar/server.py
 ```
 
+### Port 1420 already in use
+
+Tauri dev expects Vite on **port 1420** (`strictPort: true` in `vite.config.ts`). If a prior LeakSnipe session left a stale `node`/Vite listener behind, `Launch-LeakSnipe.bat` / `scripts/tauri-dev.ps1` will stop it automatically when the process looks like LeakSnipe/Vite/Tauri.
+
+If another app owns 1420, close that app (or close old LeakSnipe windows) and relaunch.
+
 ## Features
 
 | Tab | What it does |

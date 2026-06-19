@@ -1,6 +1,16 @@
-import { useState } from "react";
-import { api, type AiAnalysis, type HandDetail } from "../lib/api";
+import { useEffect, useState } from "react";
+import {
+  api,
+  formatAiProviderFromStatus,
+  isOllamaProviderRef,
+  type AiAnalysis,
+  type AiStatus,
+  type HandDetail,
+} from "../lib/api";
+import { HandAnalysisView } from "./HandAnalysisView";
 import { HandReplayer } from "./HandReplayer";
+import { OpponentHudPanel } from "./OpponentHud";
+import { AiVisualGenerator, type VisualPreset } from "./AiVisualGenerator";
 import { parseCardList, PlayingCard } from "./PlayingCard";
 
 export type PositionContext = {
@@ -36,6 +46,16 @@ export function HandDetailPanel({
   const [analyzing, setAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState<AiAnalysis | null>(null);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
+  const [datasetHands, setDatasetHands] = useState<number | null>(null);
+  const [webContextUsed, setWebContextUsed] = useState(false);
+
+  useEffect(() => {
+    api.aiStatus().then((s) => {
+      setAiStatus(s);
+      if (s.dataset_context_hands != null) setDatasetHands(s.dataset_context_hands);
+    }).catch(() => setAiStatus(null));
+  }, []);
 
   if (loading || !hand) {
     return (
@@ -51,7 +71,13 @@ export function HandDetailPanel({
     setAiError(null);
     try {
       const res = await api.analyzeHand(hand.hand_id);
-      setAnalysis(res.analysis);
+      if (res.dataset_context_hands != null) setDatasetHands(res.dataset_context_hands);
+      setWebContextUsed(Boolean(res.web_context_included ?? res.analysis.web_context_included));
+      setAnalysis({
+        ...res.analysis,
+        provider: res.analysis.provider ?? res.provider,
+        model: res.analysis.model ?? res.model,
+      });
     } catch (err) {
       setAiError(err instanceof Error ? err.message : "AI analysis failed");
     } finally {
@@ -59,7 +85,40 @@ export function HandDetailPanel({
     }
   };
 
+  const activeProviderLabel = formatAiProviderFromStatus(aiStatus);
+  const analyzingWithOllama = isOllamaProviderRef(aiStatus?.llm_provider);
+  const datasetContextActive =
+    Boolean(aiStatus?.ai_include_dataset_context ?? true) &&
+    (datasetHands ?? aiStatus?.dataset_context_hands ?? 0) > 0;
+  const webSearchMode = aiStatus?.ai_web_search_mode ?? (aiStatus?.ai_include_web_context === false ? "off" : "on_demand");
+  const webContextEnabled = webSearchMode !== "off";
+
   const heroCards = parseCardList(hand.hero_cards);
+  const opponentNames = Object.values(hand.players ?? {})
+    .filter((p) => !p.is_hero)
+    .map((p) => p.name);
+
+  const board = (hand.board_cards ?? []).join(" ");
+  const flop = (hand.board_cards ?? []).slice(0, 3).join(" ");
+  const visualPresets: VisualPreset[] = [];
+  if (flop) {
+    visualPresets.push({
+      label: "Board texture",
+      prompt: `A poker board texture diagram for the flop ${flop}, labeling draws, made hands, and how wet or dry the texture is`,
+    });
+  }
+  if (board) {
+    visualPresets.push({
+      label: "Full board",
+      prompt: `A poker board diagram showing the runout ${board}, highlighting completed draws and the strongest possible hands`,
+    });
+  }
+  if (hand.hero_position) {
+    visualPresets.push({
+      label: `${hand.hero_position} range`,
+      prompt: `A 13x13 preflop poker hand range grid chart for an opening range from the ${hand.hero_position} position`,
+    });
+  }
 
   return (
     <div className="detail-panel">
@@ -143,27 +202,49 @@ export function HandDetailPanel({
         </div>
       ) : null}
 
+      <OpponentHudPanel names={opponentNames} title="Opponents" />
+
       <div className="detail-actions">
         <button type="button" className="secondary-btn" onClick={runAi} disabled={analyzing}>
-          {analyzing ? "Analyzing with Ollama…" : "AI Coach"}
+          {analyzing ? `Analyzing with ${activeProviderLabel}…` : "AI Coach"}
         </button>
+        {datasetContextActive ? (
+          <span className="muted small">
+            Grounded in your full database ({datasetHands ?? aiStatus?.dataset_context_hands} hands)
+          </span>
+        ) : null}
+        {webContextUsed ? (
+          <span className="muted small">Live web context used</span>
+        ) : webContextEnabled && !analyzing ? (
+          <span className="muted small">
+            Web search {webSearchMode === "always" ? "always on" : "on-demand (not used for hand grading)"}
+          </span>
+        ) : null}
       </div>
 
-      {analyzing ? (
+      {analyzing && analyzingWithOllama ? (
         <p className="muted ai-analyzing-hint">Local Ollama analysis can take 1–2 minutes on large models.</p>
+      ) : analyzing ? (
+        <p className="muted ai-analyzing-hint">Cloud analysis usually finishes in a few seconds.</p>
       ) : null}
 
       {aiError ? <div className="error-banner">{aiError}</div> : null}
       {analysis ? (
         <div className="ai-result">
           <div className="detail-label">AI Coach</div>
-          <p>{analysis.summary || (analysis as { analysis?: string }).analysis || "Analysis complete."}</p>
-          {analysis.play_style ? (
-            <p className="muted">Style: {analysis.play_style}</p>
-          ) : null}
-          {analysis.mistakes_found != null ? (
-            <p className="muted">Mistakes flagged: {analysis.mistakes_found}</p>
-          ) : null}
+          <HandAnalysisView analysis={analysis} />
+        </div>
+      ) : null}
+
+      {aiStatus?.asi1_image_ready ? (
+        <div className="ai-result">
+          <AiVisualGenerator
+            available
+            model={aiStatus?.asi1_image_model}
+            presets={visualPresets}
+            placeholder="Describe a visual for this hand…"
+            title="Generate Visual"
+          />
         </div>
       ) : null}
 

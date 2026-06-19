@@ -28,6 +28,24 @@ def _canonical_path(path: str) -> str:
         return os.path.normcase(os.path.normpath(path))
 
 
+def _path_exists_quick(path: str, timeout_sec: float = 1.0) -> bool:
+    """Check path existence without blocking the API on slow/unreachable folders."""
+    if not path:
+        return False
+    result = {"exists": False}
+
+    def _probe() -> None:
+        try:
+            result["exists"] = os.path.isdir(path)
+        except OSError:
+            result["exists"] = False
+
+    probe = threading.Thread(target=_probe, daemon=True)
+    probe.start()
+    probe.join(timeout=timeout_sec)
+    return result["exists"]
+
+
 def _is_drive_root(path: str) -> bool:
     """Check if path is a drive root."""
     if not path:
@@ -35,6 +53,35 @@ def _is_drive_root(path: str) -> bool:
     norm = os.path.normpath(path)
     drive, tail = os.path.splitdrive(norm)
     return bool(drive) and tail in ("\\", "/")
+
+
+def _prune_nested_scan_dirs(entries: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Drop parent scan paths when a more specific child path is also configured."""
+    normalized: List[Tuple[str, Dict[str, str]]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = os.path.normpath(str(entry.get("path", "")).strip())
+        if not path or _is_drive_root(path):
+            continue
+        normalized.append((path, entry))
+    if len(normalized) <= 1:
+        return [entry for _, entry in normalized]
+
+    canonical = [_canonical_path(path) for path, _ in normalized]
+    keep: List[Dict[str, str]] = []
+    for i, (path, entry) in enumerate(normalized):
+        parent_path = canonical[i]
+        is_parent = False
+        for j, other_path in enumerate(canonical):
+            if i == j:
+                continue
+            if other_path != parent_path and other_path.startswith(parent_path + os.sep):
+                is_parent = True
+                break
+        if not is_parent:
+            keep.append(entry)
+    return keep if keep else [entry for _, entry in normalized]
 
 
 class HandImporter:
@@ -66,6 +113,12 @@ class HandImporter:
         """Save hand to database or memory if it doesn't exist."""
         if self.db:
             if self.db.hand_exists(hand.hand_id):
+                if (
+                    self.db.hand_needs_hero_backfill(hand.hand_id)
+                    and self.db.hand_has_hero_fields(hand)
+                ):
+                    self.db.save_hand(hand, source_file=source_file)
+                    return True
                 return False
             self.db.save_hand(hand, source_file=source_file)
             return True
@@ -101,9 +154,12 @@ class HandImporter:
 
     def full_scan(self) -> Tuple[int, int]:
         """Scan all configured directories and import new hands. Returns (saved, files_scanned)."""
+        with self.lock:
+            scan_dirs = _prune_nested_scan_dirs(list(self.settings.get("scan_dirs", [])))
+
         saved = 0
         files_count = 0
-        for entry in self.settings.get("scan_dirs", []):
+        for entry in scan_dirs:
             path = os.path.normpath(entry["path"])
             site = entry["site"]
             if _is_drive_root(path):
@@ -115,13 +171,14 @@ class HandImporter:
                     if not fname.lower().endswith(".txt"):
                         continue
                     fpath = os.path.join(root, fname)
-                    signature = self._get_file_signature(fpath)
-                    if signature is None:
-                        continue
-                    if self.file_signatures.get(fpath) == signature:
-                        continue
-                    self.file_signatures[fpath] = signature
-                    self.file_mtimes[fpath] = signature[0]
+                    with self.lock:
+                        signature = self._get_file_signature(fpath)
+                        if signature is None:
+                            continue
+                        if self.file_signatures.get(fpath) == signature:
+                            continue
+                        self.file_signatures[fpath] = signature
+                        self.file_mtimes[fpath] = signature[0]
                     try:
                         parsed = self.parser.parse_file(fpath, site)
                     except Exception as exc:
@@ -130,8 +187,9 @@ class HandImporter:
                     for h in parsed:
                         if self._save_hand_if_new(h, fpath):
                             saved += 1
-                    files_count += 1
-                    self.files_scanned.add(fpath)
+                    with self.lock:
+                        files_count += 1
+                        self.files_scanned.add(fpath)
         with self.lock:
             self.last_scan_at = datetime.now().isoformat()
             self.last_scan_saved = saved
@@ -150,6 +208,7 @@ class HandImporter:
         """Import hands from explicit file paths. Returns (saved, files_count)."""
         new_hands: List[Tuple[Hand, str]] = []
         files_count = 0
+        saved = 0
         for fpath in file_paths:
             if not os.path.isfile(fpath):
                 continue
@@ -164,6 +223,12 @@ class HandImporter:
             parsed = self.parser.parse_file(fpath, detected)
             for h in parsed:
                 if self.db and self.db.hand_exists(h.hand_id):
+                    if (
+                        self.db.hand_needs_hero_backfill(h.hand_id)
+                        and self.db.hand_has_hero_fields(h)
+                    ):
+                        self.db.save_hand(h, source_file=fpath)
+                        saved += 1
                     continue
                 new_hands.append((h, fpath))
             files_count += 1
@@ -172,7 +237,6 @@ class HandImporter:
                 self.file_signatures[fpath] = signature
                 self.file_mtimes[fpath] = signature[0]
             self.files_scanned.add(fpath)
-        saved = 0
         for h, fpath in new_hands:
             if self.db:
                 self.db.save_hand(h, source_file=fpath)
@@ -214,10 +278,11 @@ class HandImporter:
         dirs = []
         for entry in self.settings.get("scan_dirs", []):
             path = os.path.normpath(str(entry.get("path", "")).strip())
+            exists = _path_exists_quick(path)
             dirs.append({
                 "path": path,
                 "site": str(entry.get("site", "")).strip(),
-                "exists": os.path.isdir(path),
+                "exists": exists,
             })
         alive = bool(self._thread and self._thread.is_alive())
         return {

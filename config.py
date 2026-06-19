@@ -47,17 +47,35 @@ def _load_env_file(path: str = ENV_PATH) -> Dict[str, str]:
     return env_vars
 
 
+# API keys may change in .env while the sidecar runs — always refresh these on reload.
+_RELOADABLE_ENV_KEYS = frozenset({
+    "ASI_ONE_API_KEY",
+    "ASI_ONE_API_KEY_FALLBACK",
+    "ASI1_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "DEEPSEEK_API_KEY",
+})
+
+
 def bootstrap_env(path: Optional[str] = None, *, reload_file: bool = False) -> str:
     """
     Load repo-root .env into os.environ for child modules that read os.environ directly.
-    Does not override variables already set in the process environment.
+    On first load, does not override variables already set in the process environment.
+    When reload_file=True, API key vars are always refreshed from .env.
     """
     env_path = path or ENV_PATH
     if reload_file and hasattr(_get_env, "_env_cache"):
         delattr(_get_env, "_env_cache")
 
     for key, value in _load_env_file(env_path).items():
-        if value and key not in os.environ:
+        if not value:
+            continue
+        if reload_file and key in _RELOADABLE_ENV_KEYS:
+            os.environ[key] = value
+        elif key not in os.environ:
             os.environ[key] = value
 
     if hasattr(_get_env, "_env_cache"):
@@ -66,14 +84,48 @@ def bootstrap_env(path: Optional[str] = None, *, reload_file: bool = False) -> s
     return env_path
 
 
-def env_keys_detected() -> Dict[str, bool]:
+def get_asi1_fallback_api_key() -> Optional[str]:
+    """Secondary ASI:One key for parallel coach/inference workloads."""
+    key = _get_env("ASI_ONE_API_KEY_FALLBACK")
+    if _is_valid_api_key(key):
+        return key.strip()
+    return None
+
+
+def asi1_routing_mode() -> str:
+    """'split' when primary + fallback keys are both configured."""
+    if get_api_key("asi1") and get_asi1_fallback_api_key():
+        return "split"
+    return "single"
+
+
+def env_keys_detected() -> Dict[str, Any]:
     """Return which API key env vars are set (values never exposed)."""
+    asi1_primary = bool(get_api_key("asi1"))
+    asi1_fallback = bool(get_asi1_fallback_api_key())
     return {
-        "asi1": bool(get_api_key("asi1")),
+        "asi1": asi1_primary or asi1_fallback,
+        "asi1_primary": asi1_primary,
+        "asi1_fallback": asi1_fallback,
         "openai": bool(get_api_key("openai")),
         "gemini": bool(get_api_key("gemini")),
         "anthropic": bool(get_api_key("anthropic")),
+        "deepseek": bool(get_api_key("deepseek")),
     }
+
+
+def _is_valid_api_key(key: Optional[str]) -> bool:
+    if not key:
+        return False
+    value = key.strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    if lowered.startswith("your-"):
+        return False
+    if lowered in {"changeme", "xxx", "sk-your-key-here", "your-api-key-here"}:
+        return False
+    return True
 
 
 def _get_env(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -94,7 +146,7 @@ def get_api_key(provider: str) -> Optional[str]:
     Get API key for a provider securely from environment.
     
     Args:
-        provider: 'openai', 'gemini', 'anthropic', 'asi1'
+        provider: 'openai', 'gemini', 'anthropic', 'asi1', 'deepseek'
     
     Returns:
         API key or None if not set
@@ -104,6 +156,7 @@ def get_api_key(provider: str) -> Optional[str]:
         'gemini': 'GEMINI_API_KEY',
         'anthropic': 'ANTHROPIC_API_KEY',
         'asi1': 'ASI_ONE_API_KEY',
+        'deepseek': 'DEEPSEEK_API_KEY',
     }
 
     if provider not in env_map:
@@ -114,8 +167,8 @@ def get_api_key(provider: str) -> Optional[str]:
         key = _get_env('GOOGLE_API_KEY')
     if provider == 'asi1' and not key:
         key = _get_env('ASI1_API_KEY')
-    if key and key != 'your-' + env_map[provider].lower() + '-here':
-        return key
+    if _is_valid_api_key(key):
+        return key.strip()
     return None
 
 
@@ -151,14 +204,30 @@ def load_settings() -> Dict[str, Any]:
         "theme": "Slate Blue",
         "advanced_mode": False,
         "live_hud_enabled": False,
+        "live_hud_backend": "python",
         "hud_opacity": 0.75,
         "hud_seat_layout": "9max",
         "hud_density": "compact",
         "hud_anchor": "top-left",
         "hud_offset_x": 0,
         "hud_offset_y": 0,
+        "hud_edge_margin_pct": 0.12,
+        "hud_badge_scale": 1.5,
+        "hud_locked": True,
+        "hud_slot_positions": {},
         "hud_site_profiles": {},
-        "ai_provider": "ollama",
+        "ai_provider": "asi1",
+        "ollama_model": "",
+        "ai_include_dataset_context": True,
+        "ai_web_search_mode": "on_demand",
+        "ai_include_web_context": True,
+        # ASI:One personalization / agentic capabilities
+        "ai_personalization": True,   # durable per-hero coach memory (local SQLite)
+        "ai_agentic_tools": True,     # let the model call live DB-query tools
+        "asi1_model": "asi1",         # primary ASI:One chat/tools model
+        # Primary hero identity for coach memory + ASI:One session id. Stats and
+        # dataset context still cover ALL hero aliases; this only scopes memory.
+        "coach_memory_hero": "JohnDaWalka",
     }
     
     if not os.path.exists(SETTINGS_PATH):
@@ -175,6 +244,30 @@ def load_settings() -> Dict[str, Any]:
         
         # Merge with defaults (in case new keys were added)
         merged = {**default_settings, **settings}
+        mode = (merged.get("ai_web_search_mode") or "").strip().lower()
+        if mode not in ("off", "on_demand", "always"):
+            if merged.get("ai_include_web_context") is False:
+                merged["ai_web_search_mode"] = "off"
+            else:
+                merged["ai_web_search_mode"] = "on_demand"
+        merged["ai_include_web_context"] = merged.get("ai_web_search_mode") != "off"
+        # Legacy installs kept "auto" — when ASI:One key is present, treat as explicit asi1
+        # so Settings UI and AIProcessor stay aligned with the recommended cloud provider.
+        if merged.get("ai_provider") == "auto" and get_api_key("asi1"):
+            merged["ai_provider"] = "asi1"
+            if settings.get("ai_provider") == "auto":
+                save_settings(merged)
+        # Map retired model names to the current ASI:One family.
+        legacy_asi1 = {
+            "asi1-fast": "asi1-mini",
+            "asi1-extended": "asi1-ultra",
+            "asi1-agentic": "asi1",
+        }
+        asi1_pick = (merged.get("asi1_model") or "").strip()
+        if asi1_pick in legacy_asi1:
+            merged["asi1_model"] = legacy_asi1[asi1_pick]
+            if settings.get("asi1_model") in legacy_asi1:
+                save_settings(merged)
         return merged
     except Exception as e:
         log.error(f"Failed to load settings.json: {e}")

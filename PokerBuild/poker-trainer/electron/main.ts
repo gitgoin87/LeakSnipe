@@ -10,6 +10,7 @@ import { registerIpcHandlers } from './ipcHandlers';
 import { parseHandHistory } from './services/handParser';
 import { CloudSyncManager } from './services/cloudSync';
 import { AutoBackupService } from './services/autoBackup';
+import { ELECTRON_ROOT } from './electronPaths';
 
 let dbUrl: string;
 let db: any;
@@ -20,7 +21,7 @@ let autoBackup: AutoBackupService | null = null;
 // Paths
 let historyWatcher: any = null;
 
-process.env.DIST = path.join(__dirname, '../dist');
+process.env.DIST = path.join(ELECTRON_ROOT, '../dist');
 process.env.VITE_PUBLIC = app.isPackaged ? process.env.DIST : path.join(process.env.DIST, '../public');
 
 let win: BrowserWindow | null;
@@ -119,7 +120,7 @@ function createWindow() {
     title: 'Poker Therapist Suite',
     icon: path.join(process.env.VITE_PUBLIC!, 'vite.svg'),
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(ELECTRON_ROOT, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },

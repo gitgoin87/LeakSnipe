@@ -6,7 +6,12 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 pydantic>=2.0.0
 
-# AI (ai_processor.py) — at least one of OpenAI / Gemini keys in .env
+# AI (ai_processor.py) — cloud via OpenAI SDK (ASI:One, OpenAI, DeepSeek) + Gemini + Claude
+# ASI:One uses the same `openai` package against https://api.asi1.ai/v1 — no uagents required.
 openai>=1.0.0
 google-generativeai>=0.8.0
 anthropic>=0.39.0
+ddgs>=9.0.0
+
+# Theory tooling (CFR+ / value net) — lightweight numpy MLP; torch optional
+numpy>=1.24.0

@@ -40,6 +40,24 @@ from matplotlib.figure import Figure
 import logging
 
 LOG_PATH = os.path.join(tempfile.gettempdir(), "poker_debug.log")
+HUD_LOG_PATH = os.path.join(tempfile.gettempdir(), "leaksnipe_python_hud.log")
+HUD_PID_PATH = os.path.join(tempfile.gettempdir(), "leaksnipe_python_hud.pid")
+
+
+def _write_hud_pid():
+    try:
+        with open(HUD_PID_PATH, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def _remove_hud_pid():
+    try:
+        if os.path.isfile(HUD_PID_PATH):
+            os.remove(HUD_PID_PATH)
+    except OSError:
+        pass
 
 # Configure logging without blocking startup if the file path is unusable.
 try:
@@ -70,9 +88,11 @@ except ImportError:
 try:
     import win32gui
     import win32con
+    import win32process
     HAS_WIN32 = True
 except ImportError:
     HAS_WIN32 = False
+    win32process = None  # type: ignore
 
 # Import refactored modules
 from themes import THEMES, lighten as _lighten, darken as _darken, blend as _blend
@@ -81,7 +101,12 @@ from parsers import HandParser
 from analysis import LeakEngine, SummaryGenerator
 from importing import HandImporter, discover_scan_dirs, merge_scan_dirs
 from ocr_capture import OCRCaptureBridge, ReplayWindowCapture
-from utils import font_style as _font_style, canonical_path as _canonical_path, format_hero_result
+from utils import (
+    font_style as _font_style,
+    canonical_path as _canonical_path,
+    format_hero_result,
+    hero_aliases_from_settings,
+)
 
 # ── Global font system ────────────────────────────────────────────────────────
 # UI chrome (labels, buttons, tabs) uses Segoe UI — clean, proportional.
@@ -179,6 +204,10 @@ DEFAULT_SETTINGS = {
     "hud_anchor": "top-left",
     "hud_offset_x": 0,
     "hud_offset_y": 0,
+    "hud_edge_margin_pct": 0.12,
+    "hud_badge_scale": 1.5,
+    "hud_locked": True,
+    "hud_slot_positions": {},
     "hud_site_profiles": {},
 }
 
@@ -186,6 +215,50 @@ HUD_DENSITY_OPTIONS = ("mini", "compact", "standard", "expanded")
 HUD_ANCHOR_OPTIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
 HUD_SITE_PRESET_OPTIONS = ("auto", "off", "CoinPoker", "BetACR", "GGPoker", "ReplayPoker")
 HUD_PROFILE_SITES = ("CoinPoker", "BetACR", "GGPoker", "ReplayPoker")
+
+
+def _normalize_hud_slot_offset(raw_offset):
+    """Normalize a per-slot HUD position (pixel nudge and/or fx/fy fractions)."""
+    if not isinstance(raw_offset, dict):
+        return None
+    entry = {}
+    if "fx" in raw_offset or "fy" in raw_offset:
+        try:
+            entry["fx"] = round(max(0.0, min(1.0, float(raw_offset.get("fx", 0)))), 4)
+        except (TypeError, ValueError):
+            entry["fx"] = 0.0
+        try:
+            entry["fy"] = round(max(0.0, min(1.0, float(raw_offset.get("fy", 0)))), 4)
+        except (TypeError, ValueError):
+            entry["fy"] = 0.0
+    if "x" in raw_offset or "y" in raw_offset:
+        try:
+            entry["x"] = int(raw_offset.get("x", 0))
+        except (TypeError, ValueError):
+            entry["x"] = 0
+        try:
+            entry["y"] = int(raw_offset.get("y", 0))
+        except (TypeError, ValueError):
+            entry["y"] = 0
+    return entry or None
+
+
+def normalize_hud_slot_positions(raw_positions):
+    """Normalize layout-slot positions keyed by slot index 1-9."""
+    normalized = {}
+    if not isinstance(raw_positions, dict):
+        return normalized
+    for raw_slot, raw_offset in raw_positions.items():
+        try:
+            slot = int(raw_slot)
+        except (TypeError, ValueError):
+            continue
+        if slot < 1 or slot > 9:
+            continue
+        entry = _normalize_hud_slot_offset(raw_offset)
+        if entry:
+            normalized[str(slot)] = entry
+    return normalized
 
 
 def normalize_hud_site_profiles(raw_profiles):
@@ -207,25 +280,7 @@ def normalize_hud_site_profiles(raw_profiles):
             offset_y = int(profile.get("offset_y", 0))
         except (TypeError, ValueError):
             offset_y = 0
-        badge_offsets = {}
-        raw_badge_offsets = profile.get("badge_offsets", {})
-        if isinstance(raw_badge_offsets, dict):
-            for raw_seat, raw_offset in raw_badge_offsets.items():
-                try:
-                    seat = int(raw_seat)
-                except (TypeError, ValueError):
-                    continue
-                if not isinstance(raw_offset, dict):
-                    continue
-                try:
-                    badge_x = int(raw_offset.get("x", 0))
-                except (TypeError, ValueError):
-                    badge_x = 0
-                try:
-                    badge_y = int(raw_offset.get("y", 0))
-                except (TypeError, ValueError):
-                    badge_y = 0
-                badge_offsets[str(seat)] = {"x": badge_x, "y": badge_y}
+        badge_offsets = normalize_hud_slot_positions(profile.get("badge_offsets", {}))
 
         normalized[site] = {
             "anchor": anchor if anchor in HUD_ANCHOR_OPTIONS else "top-left",
@@ -785,6 +840,45 @@ class HandDatabase:
                     "fold_cbet": row[6], "wtsd": row[7],
                     "effective_type": row[1] if row[1] else row[0],
                 }
+            finally:
+                conn.close()
+
+    def get_player_types_batch(self, names):
+        """Fetch cached HUD stats for multiple players in one query."""
+        if not names:
+            return {}
+        unique = list(dict.fromkeys(n for n in names if n))
+        if not unique:
+            return {}
+        placeholders = ",".join("?" * len(unique))
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"SELECT name, auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd "
+                    f"FROM player_types WHERE name IN ({placeholders})",
+                    unique,
+                ).fetchall()
+                result = {}
+                for row in rows:
+                    result[row[0]] = {
+                        "auto_type": row[1], "manual_type": row[2], "hands": row[3],
+                        "vpip": row[4], "pfr": row[5], "af": row[6],
+                        "fold_cbet": row[7], "wtsd": row[8],
+                        "effective_type": row[2] if row[2] else row[1],
+                    }
+                return result
+            finally:
+                conn.close()
+
+    def count_player_types(self):
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM player_types WHERE hands > 0"
+                ).fetchone()
+                return int(row[0]) if row else 0
             finally:
                 conn.close()
 
@@ -2039,6 +2133,18 @@ def normalize_settings(raw_settings):
     except (TypeError, ValueError):
         settings["hud_offset_y"] = 0
     settings["hud_site_profiles"] = normalize_hud_site_profiles(settings.get("hud_site_profiles"))
+    settings["hud_slot_positions"] = normalize_hud_slot_positions(settings.get("hud_slot_positions"))
+    settings["hud_locked"] = bool(settings.get("hud_locked", True))
+    try:
+        settings["hud_edge_margin_pct"] = float(settings.get("hud_edge_margin_pct", 0.12))
+    except (TypeError, ValueError):
+        settings["hud_edge_margin_pct"] = 0.12
+    settings["hud_edge_margin_pct"] = max(0.05, min(0.25, settings["hud_edge_margin_pct"]))
+    try:
+        settings["hud_badge_scale"] = float(settings.get("hud_badge_scale", 1.5))
+    except (TypeError, ValueError):
+        settings["hud_badge_scale"] = 1.5
+    settings["hud_badge_scale"] = max(0.8, min(2.5, settings["hud_badge_scale"]))
     return settings
 
 
@@ -2713,32 +2819,71 @@ class TiltMeter:
 
 # ─── Live HUD — Seat Layouts ─────────────────────────────────────────────────
 # Positions as (x_pct, y_pct) relative to the poker window size.
-# x=0 is left edge, y=0 is top edge.
+# x=0 is left edge, y=0 is top edge. Side seats stay inset (~12%+) from left/right
+# margins so badges do not cover BetACR action buttons or side info panels.
 SEAT_POSITIONS = {
     2: {
         1: (0.50, 0.82),
         2: (0.50, 0.12),
     },
     6: {
-        1: (0.50, 0.88),   # BTN / bottom
-        2: (0.82, 0.72),   # CO
-        3: (0.90, 0.38),   # MP
-        4: (0.65, 0.10),   # HJ / top-right
-        5: (0.35, 0.10),   # UTG / top-left
-        6: (0.10, 0.38),   # BB / left
+        1: (0.50, 0.88),   # hero / bottom center
+        2: (0.76, 0.74),   # CO — inset from right
+        3: (0.78, 0.34),   # MP — inset from right
+        4: (0.62, 0.12),   # HJ / top-right arc
+        5: (0.38, 0.12),   # UTG / top-left arc
+        6: (0.22, 0.34),   # BB — inset from left
     },
     9: {
-        1: (0.50, 0.88),
-        2: (0.76, 0.80),
-        3: (0.92, 0.58),
-        4: (0.88, 0.28),
-        5: (0.65, 0.10),
-        6: (0.35, 0.10),
-        7: (0.12, 0.28),
-        8: (0.08, 0.58),
-        9: (0.24, 0.80),
+        1: (0.50, 0.88),   # hero / bottom center
+        2: (0.72, 0.82),
+        3: (0.78, 0.60),
+        4: (0.72, 0.18),
+        5: (0.62, 0.10),
+        6: (0.38, 0.10),
+        7: (0.28, 0.18),
+        8: (0.22, 0.60),
+        9: (0.28, 0.82),
     },
 }
+
+
+def build_hero_anchored_seat_slots(seat_map, layout_key):
+    """Map hand-history seat numbers to layout slots with hero anchored at slot 1 (bottom)."""
+    layout = SEAT_POSITIONS.get(layout_key, {})
+    layout_slots = sorted(layout.keys())
+    if not layout_slots or not seat_map:
+        return {}
+
+    seats_sorted = sorted(seat_map.keys())
+    n = len(seats_sorted)
+    hero_seat = next(
+        (seat for seat, info in seat_map.items() if info.get("is_hero")),
+        seats_sorted[0],
+    )
+
+    hero_idx = seats_sorted.index(hero_seat)
+    slot_count = min(n, len(layout_slots))
+    return {
+        seat: layout_slots[(seats_sorted.index(seat) - hero_idx) % slot_count]
+        for seat in seat_map
+    }
+
+
+def tag_hero_seats(seat_map, settings, site):
+    """Mark hero seat using settings aliases when DB is_hero flag is missing."""
+    if any(info.get("is_hero") for info in seat_map.values()):
+        return seat_map
+    aliases = set(hero_aliases_from_settings(settings, site))
+    if not aliases:
+        return seat_map
+    tagged = {seat: dict(info) for seat, info in seat_map.items()}
+    for seat, info in tagged.items():
+        if info.get("name") in aliases:
+            info["is_hero"] = True
+            break
+    return tagged
+
 
 EXPLOIT_TIPS = {
     "Calling Station": "value bet thin, no bluffs",
@@ -2764,41 +2909,83 @@ TYPE_COLORS = {
 HUD_DENSITY_PRESETS = {
     # mini: name + 4 primary stats in one row only
     "mini": {
-        "width": 116, "height": 38, "corner": 8,
+        "width": 118, "height": 40, "corner": 9,
         "rows": 1,
-        "name_font":  ("Consolas", 8,  "bold"),
-        "label_font": ("Consolas", 6,  ""),
-        "value_font": ("Consolas", 8,  "bold"),
-        "type_font":  ("Consolas", 6,  "bold"),
-    },
-    # compact: name + 4 primary stats + 2 secondary
-    "compact": {
-        "width": 140, "height": 58, "corner": 10,
-        "rows": 2,
-        "name_font":  ("Consolas", 8,  "bold"),
+        "name_font":  ("Consolas", 9,  "bold"),
         "label_font": ("Consolas", 7,  ""),
         "value_font": ("Consolas", 9,  "bold"),
         "type_font":  ("Consolas", 7,  "bold"),
     },
-    # standard: full DH2 layout — 4+4 stats + type footer
-    "standard": {
-        "width": 164, "height": 76, "corner": 12,
+    # compact: name + 4 primary stats + 2 secondary
+    "compact": {
+        "width": 142, "height": 60, "corner": 11,
         "rows": 2,
         "name_font":  ("Consolas", 9,  "bold"),
-        "label_font": ("Consolas", 7,  ""),
+        "label_font": ("Consolas", 8,  ""),
         "value_font": ("Consolas", 10, "bold"),
-        "type_font":  ("Consolas", 7,  "bold"),
+        "type_font":  ("Consolas", 8,  "bold"),
     },
-    # expanded: larger version with exploit tip
-    "expanded": {
-        "width": 200, "height": 92, "corner": 14,
+    # standard: full DH2 layout — 4+4 stats + type footer
+    "standard": {
+        "width": 166, "height": 78, "corner": 13,
         "rows": 2,
         "name_font":  ("Consolas", 10, "bold"),
         "label_font": ("Consolas", 8,  ""),
         "value_font": ("Consolas", 11, "bold"),
         "type_font":  ("Consolas", 8,  "bold"),
     },
+    # expanded: larger version with exploit tip
+    "expanded": {
+        "width": 202, "height": 94, "corner": 15,
+        "rows": 2,
+        "name_font":  ("Consolas", 11, "bold"),
+        "label_font": ("Consolas", 9,  ""),
+        "value_font": ("Consolas", 12, "bold"),
+        "type_font":  ("Consolas", 9,  "bold"),
+    },
 }
+
+
+def hud_edge_margin_pct(settings):
+    try:
+        pct = float(settings.get("hud_edge_margin_pct", 0.12))
+    except (TypeError, ValueError):
+        pct = 0.12
+    return max(0.05, min(0.25, pct))
+
+
+def hud_badge_scale(settings):
+    try:
+        scale = float(settings.get("hud_badge_scale", 1.5))
+    except (TypeError, ValueError):
+        scale = 1.5
+    return max(0.8, min(2.5, scale))
+
+
+def scaled_hud_density_preset(density, scale=1.0):
+    base = HUD_DENSITY_PRESETS.get(str(density or "standard").lower(),
+                                   HUD_DENSITY_PRESETS["standard"])
+    if scale == 1.0:
+        return base
+    scaled = dict(base)
+    scaled["width"] = int(round(base["width"] * scale))
+    scaled["height"] = int(round(base["height"] * scale))
+    scaled["corner"] = max(6, int(round(base["corner"] * scale)))
+    for key in ("name_font", "label_font", "value_font", "type_font"):
+        fam, size, *rest = base[key]
+        scaled[key] = (fam, max(7, int(round(size * scale))), *rest)
+    return scaled
+
+
+def clamp_badge_position(px, py, badge_w, badge_h, win_w, win_h, edge_margin_pct=0.12):
+    """Keep badge x inside a safe horizontal band; y inside the overlay window."""
+    margin_x = int(win_w * edge_margin_pct)
+    min_x = max((badge_w // 2) + 6, margin_x)
+    max_x = min(win_w - (badge_w // 2) - 6, win_w - margin_x)
+    px = max(min_x, min(max_x, px))
+    py = max(6, min(win_h - badge_h - 6, py))
+    return px, py
+
 
 HUD_SITE_PRESETS = {
     "CoinPoker": {"anchor": "top-left", "summary_offset": (0, 0), "badge_offset": (0, 0)},
@@ -2815,21 +3002,154 @@ _HUD_COLORKEY    = "#ff00ff"
 _HUD_COLORKEY_BGR = 0x00FF00FF  # COLORREF is BGR; magenta is symmetric
 
 
+def _setup_hud_interactive_host(toplevel):
+    """Layered colorkey host that always receives mouse input (never click-through)."""
+    try:
+        import ctypes
+        toplevel.update_idletasks()
+        inner = toplevel.winfo_id()
+        _ga = ctypes.windll.user32.GetAncestor
+        _ga.restype = ctypes.c_size_t
+        root_hwnd = int(_ga(inner, 2)) or inner
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_NOACTIVATE = 0x08000000
+        WS_EX_TRANSPARENT = 0x00000020
+        style = ctypes.windll.user32.GetWindowLongW(root_hwnd, GWL_EXSTYLE)
+        style |= WS_EX_LAYERED | WS_EX_NOACTIVATE
+        style &= ~WS_EX_TRANSPARENT
+        ctypes.windll.user32.SetWindowLongW(root_hwnd, GWL_EXSTYLE, style)
+        ctypes.windll.user32.SetLayeredWindowAttributes(root_hwnd, _HUD_COLORKEY_BGR, 0, 1)
+    except Exception:
+        pass
+
+
 # ─── Live HUD — Table Detector ───────────────────────────────────────────────
+# BetACR / ACR (WPN) tournament tables only — never anchor to LeakSnipe, Cursor, etc.
+_HUD_OWN_PID = os.getpid()
+
+_HUD_WINDOW_BLACKLIST = (
+    "leaksnipe",
+    "leak snipe",
+    "poker tracker",
+    "cursor",
+    "visual studio",
+    "vscode",
+    "code - ",
+    "poker_gui",
+    "customtkinter",
+    "electron",
+    "tauri",
+    "chrome",
+    "mozilla firefox",
+    "microsoft edge",
+    "msedge",
+    "discord",
+    "slack",
+    "notepad",
+    "powershell",
+    "windows terminal",
+    "cmd.exe",
+    "task manager",
+)
+_ACR_LOBBY_PATTERNS = (
+    "acr poker lobby",
+    "americas cardroom lobby",
+    "winning poker lobby",
+    "coinpoker lobby",
+    "ggpoker lobby",
+    "pokerstars lobby",
+)
+_ACR_GAME_HINTS = ("hold'em", "holdem", "omaha", "stud", "razz")
+_ACR_TABLE_HINTS = (
+    "table", " - no limit", " - pot limit", " - omaha", " - stud",
+    "tournament", " gtd", " pko", " bounty", "turbo", " hyper",
+    "sit & go", "sit&go", "sng",
+)
+
+
+def _hud_is_own_window(hwnd) -> bool:
+    if not HAS_WIN32 or win32process is None:
+        return False
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        return pid == _HUD_OWN_PID
+    except Exception:
+        return False
+
+
+def _hud_title_blacklisted(title: str) -> bool:
+    tl = (title or "").lower()
+    return any(b in tl for b in _HUD_WINDOW_BLACKLIST)
+
+
+def _is_acr_table_window(title: str, hwnd=None) -> bool:
+    """True for visible ACR/WPN table windows (not lobbies, IDE, or LeakSnipe)."""
+    if hwnd is not None and _hud_is_own_window(hwnd):
+        return False
+    if not title or _hud_title_blacklisted(title):
+        return False
+    tl = title.lower()
+    if any(lp in tl for lp in _ACR_LOBBY_PATTERNS):
+        return False
+    if "lobby" in tl and not any(g in tl for g in _ACR_GAME_HINTS):
+        return False
+    has_game = any(g in tl for g in _ACR_GAME_HINTS)
+    has_table = any(t in tl for t in _ACR_TABLE_HINTS)
+    return has_game and has_table
+
+
+def _extract_table_key_from_title(title: str) -> str:
+    """Normalized table identifier from an ACR/WPN window title."""
+    if not title:
+        return ""
+    m = re.search(r"Table\s+'([^']+)'", title, re.I)
+    if m:
+        return m.group(1).strip().lower()
+    m = re.search(r"Table\s+(\d+)\b", title, re.I)
+    if m:
+        return m.group(1).strip().lower()
+    m = re.search(r"Tournament\s+#(\d+)", title, re.I)
+    if m:
+        return f"t{m.group(1)}"
+    return ""
+
+
+def _table_keys_match(window_key: str, hand_table_name: str) -> bool:
+    """True when a window table key matches a hand-history table name."""
+    if not window_key:
+        return True
+    ht = (hand_table_name or "").strip().lower()
+    if not ht:
+        return False
+    wk = window_key.lower()
+    if wk == ht:
+        return True
+    if wk.isdigit():
+        if re.search(rf"\btable\s+{re.escape(wk)}\b", ht):
+            return True
+        if ht == wk or ht.endswith(wk):
+            return True
+    if wk.startswith("t") and wk[1:].isdigit():
+        return wk[1:] in ht
+    return wk in ht or ht in wk
+
+
+def _seat_map_signature(seat_map) -> tuple:
+    """Stable roster signature for diffing seat maps."""
+    items = []
+    for seat, info in seat_map.items():
+        items.append((int(seat), str(info.get("name") or "").strip(), bool(info.get("is_hero"))))
+    return tuple(sorted(items))
+
+
 class TableDetector:
     """Finds the active poker client window using win32gui and tracks its screen rect."""
 
-    WINDOW_TITLES = [
-        # WPN table windows — title contains game type
-        "Hold'em", "Omaha", "Stud",
-        # WPN / ACR branded windows (lobby / cashier)
-        "ACR Poker", "Americas Cardroom", "Winning Poker",
-        # Other sites
-        "CoinPoker", "BetACR", "Replay Poker",
-    ]
+    WINDOW_TITLES = []  # legacy — matching uses _is_acr_table_window()
 
-    # Lobby-only patterns — deprioritised when a table window exists
-    _LOBBY_PATTERNS = {"acr poker lobby", "coinpoker lobby", "winning poker lobby"}
+    # Lobby-only patterns — never used as HUD anchors
+    _LOBBY_PATTERNS = set(_ACR_LOBBY_PATTERNS)
 
     def __init__(self, on_rect_change=None, poll_interval=1.5):
         self.on_rect_change = on_rect_change
@@ -2842,33 +3162,26 @@ class TableDetector:
         """Return (hwnd, x, y, w, h) for the best matching poker window, or None."""
         if not HAS_WIN32:
             return None
-        tables, lobbies = [], []
+        tables = []
 
         def _cb(hwnd, _):
-            if not win32gui.IsWindowVisible(hwnd):
+            if not win32gui.IsWindowVisible(hwnd) or _hud_is_own_window(hwnd):
                 return
             title = win32gui.GetWindowText(hwnd)
-            tl = title.lower()
-            for pattern in self.WINDOW_TITLES:
-                if pattern.lower() in tl:
-                    try:
-                        r = win32gui.GetWindowRect(hwnd)
-                        x, y, x2, y2 = r
-                        w, h = x2 - x, y2 - y
-                        if w > 200 and h > 150:
-                            entry = (hwnd, x, y, w, h)
-                            if any(lp in tl for lp in self._LOBBY_PATTERNS):
-                                lobbies.append(entry)
-                            else:
-                                tables.append(entry)
-                    except Exception:
-                        pass
-                    break
+            if not _is_acr_table_window(title, hwnd):
+                return
+            try:
+                r = win32gui.GetWindowRect(hwnd)
+                x, y, x2, y2 = r
+                w, h = x2 - x, y2 - y
+                if w > 200 and h > 150:
+                    tables.append((hwnd, x, y, w, h))
+            except Exception:
+                pass
 
         win32gui.EnumWindows(_cb, None)
-        result = (tables or lobbies or [None])[0]
-        logging.debug(f"TableDetector: tables={len(tables)} lobbies={len(lobbies)} result={result}")
-        # Prefer actual table windows; fall back to lobby if nothing else found
+        result = tables[0] if tables else None
+        logging.debug(f"TableDetector: acr_tables={len(tables)} result={result}")
         return result
 
     def get_rect(self):
@@ -2895,29 +3208,29 @@ class TableDetector:
 
 
 class MultiTableDetector:
-    """Finds ALL active poker windows simultaneously and fires add/remove/move callbacks."""
+    """Finds ALL active BetACR/ACR table windows and fires add/remove/move callbacks."""
 
-    WINDOW_TITLES = [
-        "Hold'em", "Omaha", "Stud",
-        "ACR Poker", "Americas Cardroom", "Winning Poker",
-        "CoinPoker", "BetACR", "GGPoker", "GG Poker", "Replay Poker",
-        "PokerStars", "888poker", "partypoker", "iPoker",
-        "WPN Poker", "Bovada",
-    ]
-    _LOBBY_PATTERNS = {
-        "acr poker lobby", "coinpoker lobby", "winning poker lobby",
-        "ggpoker lobby", "pokerstars lobby",
-    }
+    WINDOW_TITLES = []  # legacy — matching uses _is_acr_table_window()
+    _LOBBY_PATTERNS = set(_ACR_LOBBY_PATTERNS)
     MIN_W, MIN_H = 150, 100  # catch small tables too
 
-    def __init__(self, on_table_added=None, on_table_removed=None, on_table_moved=None, poll_interval=1.5):
+    def __init__(
+        self,
+        on_table_added=None,
+        on_table_removed=None,
+        on_table_moved=None,
+        on_table_switched=None,
+        poll_interval=1.5,
+    ):
         self.on_table_added   = on_table_added
         self.on_table_removed = on_table_removed
         self.on_table_moved   = on_table_moved
+        self.on_table_switched = on_table_switched
         self.poll_interval    = poll_interval
         self._stop   = threading.Event()
         self._thread = None
         self._tables: dict = {}  # hwnd → (x, y, w, h)
+        self._titles: dict = {}  # hwnd → window title
 
     def find_all_windows(self):
         """Return {hwnd: (x, y, w, h, title, is_lobby)} for all matching visible windows."""
@@ -2925,28 +3238,22 @@ class MultiTableDetector:
             return {}
         found = {}
         def _cb(hwnd, _):
-            if not win32gui.IsWindowVisible(hwnd):
+            if not win32gui.IsWindowVisible(hwnd) or _hud_is_own_window(hwnd):
                 return
             title = win32gui.GetWindowText(hwnd)
-            tl = title.lower()
-            for pattern in self.WINDOW_TITLES:
-                if pattern.lower() in tl:
-                    try:
-                        r = win32gui.GetWindowRect(hwnd)
-                        x, y, x2, y2 = r
-                        w, h = x2 - x, y2 - y
-                        if w >= self.MIN_W and h >= self.MIN_H:
-                            is_lobby = any(lp in tl for lp in self._LOBBY_PATTERNS)
-                            found[hwnd] = (x, y, w, h, title, is_lobby)
-                    except Exception:
-                        pass
-                    break
+            if not _is_acr_table_window(title, hwnd):
+                return
+            try:
+                r = win32gui.GetWindowRect(hwnd)
+                x, y, x2, y2 = r
+                w, h = x2 - x, y2 - y
+                if w >= self.MIN_W and h >= self.MIN_H:
+                    found[hwnd] = (x, y, w, h, title, False)
+            except Exception:
+                pass
         win32gui.EnumWindows(_cb, None)
-        tables  = {h: v for h, v in found.items() if not v[5]}
-        lobbies = {h: v for h, v in found.items() if v[5]}
-        result  = tables if tables else lobbies
-        logging.debug(f"MultiTableDetector: {len(tables)} tables, {len(lobbies)} lobbies found")
-        return result
+        logging.debug(f"MultiTableDetector: {len(found)} ACR table(s) found")
+        return found
 
     def get_window_title(self, hwnd):
         try:
@@ -2960,6 +3267,7 @@ class MultiTableDetector:
     def start(self):
         self._stop.clear()
         self._tables = {}
+        self._titles = {}
         self._thread = threading.Thread(target=self._poll, daemon=True)
         self._thread.start()
 
@@ -2975,23 +3283,34 @@ class MultiTableDetector:
             self._stop.wait(self.poll_interval)
 
     def _check(self):
-        current     = self.get_all_rects()
-        prev        = self._tables
-        prev_set    = set(prev.keys())
+        current_full = self.find_all_windows()
+        current = {h: v[:4] for h, v in current_full.items()}
+        current_titles = {h: v[4] for h, v in current_full.items()}
+        prev = self._tables
+        prev_set = set(prev.keys())
         current_set = set(current.keys())
         for hwnd in prev_set - current_set:
             logging.info(f"Table removed: hwnd={hwnd}")
+            self._titles.pop(hwnd, None)
             if self.on_table_removed:
                 self.on_table_removed(hwnd)
         for hwnd in current_set - prev_set:
-            logging.info(f"Table added: hwnd={hwnd} rect={current[hwnd]}")
+            title = current_titles.get(hwnd, "")
+            logging.info(f"Table added: hwnd={hwnd} rect={current[hwnd]} title={title!r}")
             if self.on_table_added:
-                self.on_table_added(hwnd, current[hwnd])
+                self.on_table_added(hwnd, current[hwnd], title)
         for hwnd in current_set & prev_set:
-            if current[hwnd] != prev[hwnd]:
+            old_title = self._titles.get(hwnd, "")
+            new_title = current_titles.get(hwnd, "")
+            if new_title and new_title != old_title:
+                logging.info(f"Table switched: hwnd={hwnd} {old_title!r} -> {new_title!r}")
+                if self.on_table_switched:
+                    self.on_table_switched(hwnd, old_title, new_title, current[hwnd])
+            elif current[hwnd] != prev[hwnd]:
                 if self.on_table_moved:
-                    self.on_table_moved(hwnd, current[hwnd])
+                    self.on_table_moved(hwnd, current[hwnd], new_title)
         self._tables = dict(current)
+        self._titles = dict(current_titles)
 
 
 # ─── Live HUD — Current Hand Monitor ────────────────────────────────────────
@@ -3054,16 +3373,38 @@ class CurrentHandMonitor:
 
 
 class MultiHandMonitor:
-    """Polls poker_hands.db for the latest hand per site and emits callbacks for each new hand."""
+    """Polls poker_hands.db per ACR table window and emits roster/hand updates."""
 
-    def __init__(self, db, settings, on_new_hand=None, poll_interval=2.0):
-        self.db           = db
-        self.settings     = settings
-        self.on_new_hand  = on_new_hand
+    def __init__(self, db, settings, on_hand_update=None, poll_interval=2.0):
+        self.db = db
+        self.settings = settings
+        self.on_hand_update = on_hand_update
         self.poll_interval = poll_interval
-        self._stop        = threading.Event()
-        self._thread      = None
-        self._last_hand_per_site: dict = {}  # site → hand_id
+        self._stop = threading.Event()
+        self._thread = None
+        self._windows: Dict[int, str] = {}  # hwnd → table_key from window title
+        self._last_sig: Dict[int, tuple] = {}  # hwnd → (hand_id, roster_signature)
+        self._check_lock = threading.Lock()
+
+    def register_window(self, hwnd, title: str = ""):
+        key = _extract_table_key_from_title(title)
+        with self._check_lock:
+            prev = self._windows.get(hwnd)
+            self._windows[hwnd] = key
+            if prev != key:
+                self._last_sig.pop(hwnd, None)
+
+    def unregister_window(self, hwnd):
+        with self._check_lock:
+            self._windows.pop(hwnd, None)
+            self._last_sig.pop(hwnd, None)
+
+    def check_now(self):
+        """Immediate poll — call after HH import or table switch."""
+        try:
+            self._check()
+        except Exception:
+            logging.exception("Live hand monitor check_now failed")
 
     def start(self):
         self._stop.clear()
@@ -3081,37 +3422,69 @@ class MultiHandMonitor:
                 pass
             self._stop.wait(self.poll_interval)
 
+    def _load_recent_hands(self, conn):
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT hand_id, max_seats, site, table_name FROM hands "
+            "ORDER BY imported_at DESC LIMIT 80"
+        ).fetchall()
+
+    def _load_seat_map(self, conn, hand_id):
+        players = conn.execute(
+            "SELECT seat, name, is_hero FROM players WHERE hand_id = ?", (hand_id,)
+        ).fetchall()
+        return {
+            p["seat"]: {"name": p["name"], "is_hero": bool(p["is_hero"])}
+            for p in players
+        }
+
+    def _pick_hand_for_table(self, rows, table_key: str):
+        if table_key:
+            for row in rows:
+                if _table_keys_match(table_key, row["table_name"] or ""):
+                    return row
+        return None
+
     def _check(self):
+        with self._check_lock:
+            windows = dict(self._windows)
+        if not windows:
+            return
+
         with self.db.lock:
             conn = self.db._connect()
             try:
-                conn.row_factory = sqlite3.Row
-                # Get latest hand per site (scan last 20 to cover all active tables)
-                rows = conn.execute(
-                    "SELECT hand_id, max_seats, site FROM hands ORDER BY imported_at DESC LIMIT 20"
-                ).fetchall()
-                seen_sites = set()
-                for row in rows:
-                    site = row["site"] or "Unknown"
-                    if site in seen_sites:
+                rows = self._load_recent_hands(conn)
+                if not rows:
+                    return
+                fallback_row = rows[0]
+                updates = []
+                for hwnd, table_key in windows.items():
+                    row = self._pick_hand_for_table(rows, table_key)
+                    if row is None and len(windows) == 1:
+                        row = fallback_row
+                    if row is None:
                         continue
-                    seen_sites.add(site)
                     hand_id = row["hand_id"]
-                    if self._last_hand_per_site.get(site) == hand_id:
+                    seat_map = self._load_seat_map(conn, hand_id)
+                    sig = (hand_id, _seat_map_signature(seat_map))
+                    if self._last_sig.get(hwnd) == sig:
                         continue
-                    self._last_hand_per_site[site] = hand_id
-                    max_seats = row["max_seats"] or 6
-                    players = conn.execute(
-                        "SELECT seat, name, is_hero FROM players WHERE hand_id = ?", (hand_id,)
-                    ).fetchall()
-                    seat_map = {
-                        p["seat"]: {"name": p["name"], "is_hero": bool(p["is_hero"])}
-                        for p in players
-                    }
-                    if self.on_new_hand:
-                        self.on_new_hand(hand_id, seat_map, max_seats, site)
+                    self._last_sig[hwnd] = sig
+                    updates.append((
+                        hwnd,
+                        hand_id,
+                        seat_map,
+                        row["max_seats"] or 6,
+                        row["site"] or "BetACR",
+                        row["table_name"] or "",
+                    ))
             finally:
                 conn.close()
+
+        if self.on_hand_update:
+            for payload in updates:
+                self.on_hand_update(*payload)
 
 
 # ─── Live HUD — Stat Tooltip ─────────────────────────────────────────────────
@@ -3235,7 +3608,7 @@ class SeatBadge(tk.Canvas):
     """DriveHUD2-style seat badge: floating name label + dark grid card with
     colour-coded stats (VPIP/PFR/AF/WSD row-1; FCBet/type row-2)."""
 
-    W, H = 164, 94   # class-level defaults; overridden per preset
+    W, H = 166, 96   # class-level defaults; overridden per preset
 
     # Primary stats: 4 columns, always shown
     _ROW1 = [
@@ -3252,15 +3625,16 @@ class SeatBadge(tk.Canvas):
         (None, None, None),   # spacer
     ]
 
-    def __init__(self, parent, theme, player_info, stat, density="standard", db=None, **kwargs):
+    def __init__(self, parent, theme, player_info, stat, density="standard", db=None, loading=False,
+                 badge_scale=1.0, **kwargs):
         t = theme
         self._theme = t
         self._stat  = stat
         self._db    = db
+        self._loading = loading
 
-        p = HUD_DENSITY_PRESETS.get(str(density or "standard").lower(),
-                                     HUD_DENSITY_PRESETS["standard"])
-        LABEL_H = 18          # floating name strip height (transparent)
+        p = scaled_hud_density_preset(density, badge_scale)
+        LABEL_H = max(16, int(round(20 * badge_scale)))
         W  = p["width"]
         CH = p["height"]      # card height
         H  = CH + LABEL_H     # total canvas height
@@ -3271,7 +3645,10 @@ class SeatBadge(tk.Canvas):
 
         name           = player_info.get("name", "?")
         self._player_name = name
-        classification = (stat.get("effective_type") or "Unknown") if stat else "Unknown"
+        if loading:
+            classification = "..."
+        else:
+            classification = (stat.get("effective_type") or "Unknown") if stat else "Unknown"
 
         # ── Floating name label (no background — transparent to table) ────────
         self.create_text(W // 2, LABEL_H // 2, text=name[:22], anchor="center",
@@ -3287,7 +3664,7 @@ class SeatBadge(tk.Canvas):
         self._rrect(0, LABEL_H, W - 6, H - 6, r, fill=BG, outline=BDR, width=1)
 
         # ── Header strip: type pill (left)  H:nnn (right) ────────────────────
-        HEADER_H = 16
+        HEADER_H = max(14, int(round(18 * badge_scale)))
         HDR_BG   = _darken(BG, 0.08)
         self._rrect(0, LABEL_H, W - 6, LABEL_H + HEADER_H, r, fill=HDR_BG, outline="")
         # flatten bottom of header (re-draw lower half as plain rect)
@@ -3326,17 +3703,21 @@ class SeatBadge(tk.Canvas):
             lbl_y  = cell_y + 5
             val_y  = cell_y + row_h - 6
 
-            # raw value
-            raw = stat.get(key, 0) if stat else 0
-            if key == "hands":
-                val_str = str(int(raw)) if raw else "–"
-                val_col = t.get("gold", "#FFD700")
-            elif key == "af":
-                val_str = f"{raw:.1f}" if raw else "–"
-                val_col = _hud_stat_color(t, key, raw)
+            if self._loading:
+                val_str = "..."
+                val_col = t.get("text_dim", "#888")
             else:
-                val_str = (f"{raw:.0f}{suffix}" if raw else "–")
-                val_col = _hud_stat_color(t, key, raw)
+                # raw value
+                raw = stat.get(key, 0) if stat else 0
+                if key == "hands":
+                    val_str = str(int(raw)) if raw else "–"
+                    val_col = t.get("gold", "#FFD700")
+                elif key == "af":
+                    val_str = f"{raw:.1f}" if raw else "–"
+                    val_col = _hud_stat_color(t, key, raw)
+                else:
+                    val_str = (f"{raw:.0f}{suffix}" if raw else "–")
+                    val_col = _hud_stat_color(t, key, raw)
 
             # column divider (skip leftmost)
             if col_idx > 0:
@@ -3377,8 +3758,10 @@ class SeatBadge(tk.Canvas):
                                          width=int(col_w * 2 - 4))
                     break
 
-        # Hover tooltip bindings
+        # Hover / click tooltip bindings
         self._tooltip = None
+        self._pinned = False
+        self._drag_moved = False
         self.bind("<Enter>", self._show_tooltip)
         self.bind("<Leave>", self._hide_tooltip)
 
@@ -3391,13 +3774,23 @@ class SeatBadge(tk.Canvas):
         except Exception:
             self._tooltip = None
 
-    def _hide_tooltip(self, event=None):
+    def _hide_tooltip(self, event=None, *, force=False):
+        if self._pinned and not force:
+            return
         if self._tooltip:
             try:
                 self._tooltip.destroy()
             except Exception:
                 pass
             self._tooltip = None
+
+    def toggle_pinned_stats(self):
+        """Pin or unpin the full-stats tooltip (click when HUD is locked)."""
+        self._pinned = not self._pinned
+        if self._pinned:
+            self._show_tooltip()
+        else:
+            self._hide_tooltip(force=True)
 
     def _rrect(self, x1, y1, x2, y2, r, **kw):
         pts = [x1+r,y1, x2-r,y1, x2-r,y1, x2,y1, x2,y1+r,
@@ -3423,7 +3816,7 @@ class HUDSummaryPanel(tk.Canvas):
         self.delete("all")
         self._rrect(8, 8, self.W - 1, self.H - 1, 18, fill=_darken(t["bg_base"], 0.6), outline="")
         self._rrect(0, 0, self.W - 10, self.H - 10, 18, fill=_lighten(t["bg_card"], 0.02), outline=t["border"], width=1)
-        title = "LAYOUT MODE" if layout_mode else "LIVE HUD"
+        title = "DRAG MODE" if layout_mode else "LIVE HUD"
         self.create_text(18, 18, text=title, anchor="w", fill=t["text"], font=("Consolas", 11, "bold"))
         self.create_oval(self.W - 44, 14, self.W - 30, 28, fill=accent, outline="")
         self.create_text(18, 38, text=f"Site  {site}", anchor="w", fill=t["text_dim"], font=("Consolas", 9))
@@ -3494,14 +3887,41 @@ class HUDLayoutHintPanel(tk.Canvas):
         self.delete("all")
         self.create_rectangle(5, 7, self.W - 1, self.H - 1, fill=_darken(t["bg_base"], 0.5), outline="")
         self.create_rectangle(0, 0, self.W - 6, self.H - 6, fill=_lighten(t["bg_panel"], 0.02), outline=t["border"], width=1)
-        text = f"Target {target_label}  •  Tab cycle  •  Arrows nudge  •  Shift+Arrows x10  •  Backspace reset  •  Esc exit"
+        text = f"DRAG MODE — {target_label}  •  drag badges  •  Tab cycle  •  Arrows nudge  •  Esc lock"
         self.create_text(12, self.H / 2 - 3, text=text, anchor="w", fill=t["text_dim"], font=("Consolas", 8, "bold"))
 
 
-class HUDLayoutToggle(tk.Canvas):
-    """Small always-visible button on HUD overlay to toggle layout/drag mode."""
+class HUDCloseButton(tk.Canvas):
+    """Small close control on the HUD toolbar."""
 
-    W, H = 160, 22
+    W, H = 22, 22
+
+    def __init__(self, parent, theme, on_click):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=_HUD_COLORKEY, highlightthickness=0)
+        self._theme = theme
+        self._on_click = on_click
+        self._draw()
+        self.bind("<ButtonPress-1>", lambda _e: self._on_click())
+
+    def _draw(self):
+        self.delete("all")
+        t = self._theme
+        bg = _lighten(t.get("bg_panel", "#222"), 0.08)
+        self.create_rectangle(0, 0, self.W, self.H, fill=bg, outline=t.get("border", "#444"))
+        self.create_text(self.W / 2, self.H / 2, text="✕", fill=t.get("orange", "#ff8c00"),
+                         font=("Consolas", 9, "bold"), anchor="center")
+
+
+class HUDLayoutToggle(tk.Canvas):
+    """Lock / unlock HUD — unlocked = drag mode for seat badges."""
+
+    W, H = 148, 22
+    RESET_W = 68
+    CLOSE_W = HUDCloseButton.W
+    TOOLBAR_GAP = 4
+    TOOLBAR_W = W + TOOLBAR_GAP + RESET_W + TOOLBAR_GAP + CLOSE_W
+    TOOLBAR_H = max(H, HUDCloseButton.H)
 
     def __init__(self, parent, theme, on_click):
         super().__init__(parent, width=self.W, height=self.H,
@@ -3517,17 +3937,19 @@ class HUDLayoutToggle(tk.Canvas):
         self.delete("all")
         t = self._theme
         bg = t.get("accent", t.get("orange", "#ff8c00")) if self._layout_mode else _lighten(t["bg_panel"], 0.15)
-        fg = "#ffffff"
+        fg = "#ffffff" if self._layout_mode else t.get("text", "#ddd")
         r = 8
         W, H = self.W, self.H
-        # Rounded rect via overlapping rectangles + corner arcs
         self.create_arc(0, 0, 2*r, 2*r, start=90, extent=90, fill=bg, outline="")
         self.create_arc(W-2*r, 0, W, 2*r, start=0, extent=90, fill=bg, outline="")
         self.create_arc(0, H-2*r, 2*r, H, start=180, extent=90, fill=bg, outline="")
         self.create_arc(W-2*r, H-2*r, W, H, start=270, extent=90, fill=bg, outline="")
         self.create_rectangle(r, 0, W-r, H, fill=bg, outline="")
         self.create_rectangle(0, r, W, H-r, fill=bg, outline="")
-        label = "✓ DONE  [Ctrl+Shift+H]" if self._layout_mode else "✥ LAYOUT  [Ctrl+Shift+H]"
+        if self._layout_mode:
+            label = "DRAG MODE — Lock [H]"
+        else:
+            label = "Unlock HUD [Ctrl+Shift+H]"
         self.create_text(W//2, H//2, text=label, fill=fg,
                          font=("Consolas", 6, "bold"), anchor="center")
 
@@ -3539,37 +3961,253 @@ class HUDLayoutToggle(tk.Canvas):
         self._on_click()
 
 
+class HUDResetSeatsButton(tk.Canvas):
+    """Restore default SEAT_POSITIONS for all layout slots."""
+
+    W, H = 68, 22
+
+    def __init__(self, parent, theme, on_click):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=_HUD_COLORKEY, highlightthickness=0)
+        self._theme = theme
+        self._on_click = on_click
+        self._draw()
+        self.bind("<ButtonPress-1>", lambda _e: self._on_click())
+
+    def _draw(self):
+        self.delete("all")
+        t = self._theme
+        bg = _lighten(t.get("bg_panel", "#222"), 0.08)
+        self.create_rectangle(0, 0, self.W, self.H, fill=bg, outline=t.get("border", "#444"))
+        self.create_text(self.W / 2, self.H / 2, text="↺ Reset seats",
+                         fill=t.get("gold", "#ffd700"), font=("Consolas", 7, "bold"), anchor="center")
+
+
+# ─── Live HUD — Player stats cache ───────────────────────────────────────────
+class PlayerStatsCache:
+    """In-memory TTL cache backed by player_types SQLite reads."""
+
+    def __init__(self, db, ttl=45.0):
+        self.db = db
+        self.ttl = ttl
+        self._entries = {}
+        self._lock = threading.Lock()
+
+    def get_batch(self, names):
+        now = time.time()
+        result = {}
+        missing = []
+        with self._lock:
+            for name in names:
+                entry = self._entries.get(name)
+                if entry and (now - entry[1]) < self.ttl:
+                    result[name] = entry[0]
+                else:
+                    missing.append(name)
+        if missing:
+            batch = self.db.get_player_types_batch(missing)
+            with self._lock:
+                for name in missing:
+                    stat = batch.get(name)
+                    if stat:
+                        self._entries[name] = (stat, now)
+                        result[name] = stat
+        return result
+
+    def invalidate(self, names=None):
+        with self._lock:
+            if names is None:
+                self._entries.clear()
+            else:
+                for name in names:
+                    self._entries.pop(name, None)
+
+
+def _show_hud_error(title, message):
+    """Surface HUD startup failures to the user (console + messagebox + log)."""
+    logging.error("%s: %s", title, message)
+    try:
+        with open(HUD_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().isoformat()} ERROR {title}: {message}\n")
+    except OSError:
+        pass
+    try:
+        from tkinter import messagebox
+        messagebox.showerror(title, f"{message}\n\nLog: {HUD_LOG_PATH}")
+    except Exception:
+        pass
+
+
 # ─── Live HUD — Overlay Window ──────────────────────────────────────────────
 class LiveHUDOverlay:
     """Borderless always-on-top transparent window that overlays the poker client."""
 
-    def __init__(self, root, theme, db, settings, on_profile_changed=None):
+    def __init__(self, root, theme, db, settings, on_profile_changed=None, on_quit=None, on_lock_changed=None):
         self.root = root
         self.theme = theme
         self.db = db
         self.settings = settings
         self.on_profile_changed = on_profile_changed
+        self.on_quit = on_quit
+        self.on_lock_changed = on_lock_changed
         self._win = None
         self._badges = {}
+        self._badge_hosts = {}
         self._seat_guides = {}
         self._summary_panel = None
         self._layout_hint_panel = None
         self._current_rect = None
         self._current_site = "Unknown"
         self._opacity = float(settings.get("hud_opacity", 0.85))
-        self._layout_mode = False
+        self._layout_mode = not bool(settings.get("hud_locked", True))
         self._drag_origin = None
         self._summary_origin = None
         self._badge_drag_state = None
         self._selected_target = "summary"
         self._last_seat_map = {}
+        self._last_seat_to_slot = {}
         self._last_max_seats = 6
+        self._last_hand_id = None
+        self._bound_table_key = ""
+        self._window_title = ""
         self._layout_toggle = None
+        self._reset_btn = None
         self._toggle_win = None
         self._hotkey_thread = None
         self._hotkey_id = 1  # arbitrary ID for RegisterHotKey
         self._resize_job = None          # debounce handle for _on_win_configure
+        self._stats_cache = PlayerStatsCache(db, ttl=45.0)
+        self._stats_load_generation = 0
+        self._last_hand_signature = None
         self._start_hotkey_listener()
+
+    def _clear_badges(self):
+        for badge in self._badges.values():
+            if badge.winfo_exists():
+                badge.destroy()
+        self._badges.clear()
+        for host in self._badge_hosts.values():
+            if host.winfo_exists():
+                host.destroy()
+        self._badge_hosts.clear()
+
+    def _remove_badge(self, seat):
+        badge = self._badges.pop(seat, None)
+        if badge is not None and badge.winfo_exists():
+            badge.destroy()
+        host = self._badge_hosts.pop(seat, None)
+        if host is not None and host.winfo_exists():
+            host.destroy()
+
+    def bind_table(self, window_title: str = ""):
+        """Track ACR window title; reset roster state when table identity changes."""
+        title = window_title or self._window_title
+        self._window_title = title
+        table_key = _extract_table_key_from_title(title)
+        if table_key and table_key != self._bound_table_key:
+            logging.info(f"HUD table bind: {self._bound_table_key!r} -> {table_key!r}")
+            self.reset_for_table_switch(table_key)
+        elif not table_key:
+            self._bound_table_key = ""
+
+    def reset_for_table_switch(self, table_key: str = ""):
+        """Clear badges and cached roster when moving to a new tournament table."""
+        self._bound_table_key = table_key or _extract_table_key_from_title(self._window_title)
+        self._last_hand_id = None
+        self._last_hand_signature = None
+        self._last_seat_map = {}
+        self._last_seat_to_slot = {}
+        self._clear_badges()
+        if self._summary_panel is not None and self._summary_panel.winfo_exists():
+            self._summary_panel.render(
+                layout_key=6,
+                opponent_count=0,
+                forced=False,
+                opacity=self._opacity,
+                site=self._current_site,
+                density=str(self.settings.get("hud_density", "standard")).lower(),
+                layout_mode=self._layout_mode,
+            )
+
+    def _create_badge_host(self, seat):
+        host = tk.Toplevel(self.root)
+        host.overrideredirect(True)
+        host.attributes("-topmost", True)
+        host.configure(bg=_HUD_COLORKEY)
+        self._badge_hosts[seat] = host
+        return host
+
+    def _badge_host_screen_xy(self, px, py, badge_w):
+        tx, ty, _, _ = self._current_rect
+        return tx + px - (badge_w // 2), ty + py
+
+    def _position_badge_host(self, seat, px, py, badge):
+        host = self._badge_hosts.get(seat)
+        if host is None or not host.winfo_exists():
+            return
+        sx, sy = self._badge_host_screen_xy(px, py, badge.W)
+        host.geometry(f"{badge.W}x{badge.H}+{sx}+{sy}")
+        badge.place(x=badge.W // 2, y=0, anchor="n")
+        _setup_hud_interactive_host(host)
+        host.lift()
+
+    def _overlay_xy_from_host(self, host, badge):
+        tx, ty, _, _ = self._current_rect
+        px = host.winfo_x() - tx + (badge.W // 2)
+        py = host.winfo_y() - ty
+        return px, py
+
+    def invalidate_stats_cache(self, names=None):
+        self._stats_cache.invalidate(names)
+
+    def _edge_margin_pct(self):
+        return hud_edge_margin_pct(self.settings)
+
+    def _badge_scale(self):
+        return hud_badge_scale(self.settings)
+
+    def _slot_offset(self, badge_offsets, seat_to_slot, seat):
+        slot = seat_to_slot.get(seat)
+        if slot is None:
+            return {}
+        return badge_offsets.get(str(slot), {})
+
+    def _resolve_badge_xy(self, pos, seat_offset, badge_dx, badge_dy, w, h, badge_w, badge_h):
+        if "fx" in seat_offset and "fy" in seat_offset:
+            px = int(seat_offset["fx"] * w)
+            py = int(seat_offset["fy"] * h)
+        else:
+            px = int(pos[0] * w) + badge_dx + int(seat_offset.get("x", 0))
+            py = int(pos[1] * h) + badge_dy + int(seat_offset.get("y", 0))
+        return clamp_badge_position(
+            px, py, badge_w, badge_h, w, h, self._edge_margin_pct(),
+        )
+
+    def _layout_slot_for_seat(self, seat):
+        return self._last_seat_to_slot.get(seat)
+
+    def _persist_badge_offsets(self, profile, badge_offsets):
+        profile_site = profile.get("profile_site")
+        if profile_site:
+            existing_profile = dict(self.settings.setdefault("hud_site_profiles", {}).get(profile_site, {}))
+            summary_offset = profile.get("summary_offset", (0, 0))
+            saved_profile = {
+                "anchor": existing_profile.get("anchor", profile.get("anchor", self.settings.get("hud_anchor", "top-left"))),
+                "offset_x": existing_profile.get("offset_x", summary_offset[0]),
+                "offset_y": existing_profile.get("offset_y", summary_offset[1]),
+                "density": existing_profile.get("density", profile.get("density", self.settings.get("hud_density", "standard"))),
+                "seat_layout": existing_profile.get("seat_layout", profile.get("seat_layout", self.settings.get("hud_seat_layout", "auto"))),
+                "badge_offsets": badge_offsets,
+            }
+            self.settings.setdefault("hud_site_profiles", {})[profile_site] = saved_profile
+            if self.on_profile_changed:
+                self.on_profile_changed(profile_site, saved_profile)
+        else:
+            self.settings["hud_slot_positions"] = badge_offsets
+            if self.on_lock_changed:
+                self.on_lock_changed(self.settings)
+        if self._last_seat_map:
+            self.update_hand(self._last_seat_map, self._last_max_seats, self._current_site)
 
     # ── Global hotkey: Ctrl+Shift+H toggles layout mode ─────────────────────
     def _start_hotkey_listener(self):
@@ -3723,13 +4361,9 @@ class LiveHUDOverlay:
         forced_layout = {"2max": 2, "6max": 6, "9max": 9}.get(layout_pref)
         layout_key = forced_layout or min(SEAT_POSITIONS.keys(), key=lambda k: abs(k - self._last_max_seats))
         layout = SEAT_POSITIONS[layout_key]
+        seat_to_slot = self._last_seat_to_slot or build_hero_anchored_seat_slots(self._last_seat_map, layout_key)
         badge_dx, badge_dy = profile["badge_offset"]
         badge_offsets = profile.get("badge_offsets", {})
-
-        # Remap non-contiguous seat numbers to layout slots
-        occupied_slots = sorted(self._badges.keys())
-        layout_slots = sorted(layout.keys())
-        seat_to_slot = {s: layout_slots[i] for i, s in enumerate(occupied_slots) if i < len(layout_slots)}
 
         for seat, badge in self._badges.items():
             if not badge.winfo_exists():
@@ -3737,31 +4371,37 @@ class LiveHUDOverlay:
             pos = layout.get(seat_to_slot.get(seat))
             if pos is None:
                 continue
-            seat_offset = badge_offsets.get(str(seat), {})
+            seat_offset = self._slot_offset(badge_offsets, seat_to_slot, seat)
             if "fx" in seat_offset and "fy" in seat_offset:
                 px = int(seat_offset["fx"] * w)
                 py = int(seat_offset["fy"] * h)
             else:
                 px = int(pos[0] * w) + badge_dx + int(seat_offset.get("x", 0))
                 py = int(pos[1] * h) + badge_dy + int(seat_offset.get("y", 0))
-            px = max((badge.W // 2) + 6, min(w - (badge.W // 2) - 6, px))
-            py = max(6, min(h - badge.H - 6, py))
-            badge.place(x=px, y=py, anchor="n")
+            px, py = clamp_badge_position(
+                px, py, badge.W, badge.H, w, h, self._edge_margin_pct(),
+            )
+            self._position_badge_host(seat, px, py, badge)
 
         if self._layout_mode:
-            self._render_seat_guides(layout, self._last_seat_map, badge_offsets)
+            self._render_seat_guides(layout, self._last_seat_map, seat_to_slot, badge_offsets)
 
-    def update_hand(self, seat_map, max_seats, site="Unknown"):
-        """Refresh seat badges for a new hand. Must be called from main thread."""
+    def update_hand(self, seat_map, max_seats, site="Unknown", hand_id=None):
+        """Refresh seat badges for a new/changed roster. Must be called from main thread."""
         if self._win is None or not self._win.winfo_exists():
             return
-        # Destroy old badges
-        for badge in self._badges.values():
-            badge.destroy()
-        self._badges.clear()
-
         if self._current_rect is None:
             return
+
+        seat_map = tag_hero_seats(seat_map, self.settings, site)
+        if hand_id and hand_id != self._last_hand_id:
+            self._last_hand_id = hand_id
+        villain_names = [
+            info["name"] for info in seat_map.values()
+            if not info.get("is_hero") and info.get("name")
+        ]
+        signature = (_seat_map_signature(seat_map), max_seats, site)
+        self._last_hand_signature = signature
 
         self._last_seat_map = dict(seat_map)
         self._last_max_seats = max_seats
@@ -3772,15 +4412,12 @@ class LiveHUDOverlay:
         forced_layout = {"2max": 2, "6max": 6, "9max": 9}.get(layout_pref)
         layout_key = forced_layout or min(SEAT_POSITIONS.keys(), key=lambda k: abs(k - max_seats))
         layout = SEAT_POSITIONS[layout_key]
-        villain_count = sum(1 for info in seat_map.values() if not info.get("is_hero"))
+        seat_to_slot = build_hero_anchored_seat_slots(seat_map, layout_key)
+        self._last_seat_to_slot = seat_to_slot
+        villain_count = sum(1 for info in seat_map.values() if not info.get("is_hero") and info.get("name"))
         density = str(profile.get("density", self.settings.get("hud_density", "standard"))).lower()
         badge_dx, badge_dy = profile["badge_offset"]
         badge_offsets = profile.get("badge_offsets", {})
-
-        # Remap non-contiguous seat numbers → layout slots in seat-number order
-        occupied_seats = sorted(s for s, info in seat_map.items() if not info.get("is_hero"))
-        layout_slots   = sorted(layout.keys())
-        seat_to_slot   = {s: layout_slots[i] for i, s in enumerate(occupied_seats) if i < len(layout_slots)}
 
         self._ensure_summary_panel()
         self._ensure_layout_hint_panel()
@@ -3797,40 +4434,170 @@ class LiveHUDOverlay:
                 layout_mode=self._layout_mode,
             )
         self._refresh_selection_highlights()
+        self._render_seat_guides(layout, seat_map, seat_to_slot, badge_offsets)
 
-        self._render_seat_guides(layout, seat_map, badge_offsets)
+        cached_stats = self._stats_cache.get_batch(villain_names) if villain_names else {}
+        needs_async = any(name not in cached_stats for name in villain_names)
 
+        self._sync_seat_badges(
+            seat_map, layout, seat_to_slot, density, badge_dx, badge_dy,
+            badge_offsets, w, h, cached_stats, loading=needs_async,
+        )
+
+        if not needs_async:
+            return
+
+        generation = self._stats_load_generation + 1
+        self._stats_load_generation = generation
+
+        def _load_stats(gen=generation, sm=seat_map, ms=max_seats, st=site,
+                        hid=hand_id, names=list(villain_names), lay=layout, sts=seat_to_slot,
+                        den=density, bdx=badge_dx, bdy=badge_dy, boff=badge_offsets,
+                        width=w, height=h):
+            try:
+                stats = self._stats_cache.get_batch(names)
+            except Exception:
+                logging.exception("HUD stats batch load failed")
+                stats = {}
+            if gen != self._stats_load_generation:
+                return
+            try:
+                self.root.after(
+                    0,
+                    lambda: self._apply_loaded_stats(
+                        gen, sm, ms, st, hid, lay, sts, den, bdx, bdy, boff, width, height, stats,
+                    ),
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_load_stats, daemon=True).start()
+
+    def _desired_villain_seats(self, seat_map):
+        """Seat numbers that should show opponent badges."""
+        desired = {}
+        seen_names = set()
         for seat, info in seat_map.items():
             if info.get("is_hero"):
                 continue
+            pname = (info.get("name") or "").strip()
+            if not pname or pname in seen_names:
+                continue
+            seen_names.add(pname)
+            desired[seat] = pname
+        return desired
+
+    def _sync_seat_badges(
+        self, seat_map, layout, seat_to_slot, density, badge_dx, badge_dy,
+        badge_offsets, w, h, stats_by_name, loading=False,
+    ):
+        """Add/update/remove badges to match the current seat roster."""
+        desired = self._desired_villain_seats(seat_map)
+        for seat in list(self._badges.keys()):
+            badge = self._badges.get(seat)
+            expected_name = desired.get(seat)
+            if expected_name is None:
+                self._remove_badge(seat)
+                continue
+            if badge is not None and getattr(badge, "_player_name", None) != expected_name:
+                self._remove_badge(seat)
+
+        for seat, pname in desired.items():
+            if seat in self._badges and self._badges[seat].winfo_exists():
+                badge = self._badges[seat]
+                pos = layout.get(seat_to_slot.get(seat))
+                if pos is None:
+                    continue
+                seat_offset = self._slot_offset(badge_offsets, seat_to_slot, seat)
+                px, py = self._resolve_badge_xy(
+                    pos, seat_offset, badge_dx, badge_dy, w, h, badge.W, badge.H,
+                )
+                self._position_badge_host(seat, px, py, badge)
+                continue
+
+            info = seat_map.get(seat, {"name": pname})
             pos = layout.get(seat_to_slot.get(seat))
             if pos is None:
                 continue
-            stat = self.db.get_player_type(info["name"])
-            badge = SeatBadge(self._win, self.theme, info, stat, density=density, db=self.db)
-            seat_offset = badge_offsets.get(str(seat), {})
-            if "fx" in seat_offset and "fy" in seat_offset:
-                # User has freely placed this badge — use fraction position
-                px = int(seat_offset["fx"] * w)
-                py = int(seat_offset["fy"] * h)
-            else:
-                # Default: use seat layout + optional pixel nudge
-                px = int(pos[0] * w) + badge_dx + int(seat_offset.get("x", 0))
-                py = int(pos[1] * h) + badge_dy + int(seat_offset.get("y", 0))
-            px = max((badge.W // 2) + 6, min(w - (badge.W // 2) - 6, px))
-            py = max(6, min(h - badge.H - 6, py))
-            badge.place(x=px, y=py, anchor="n")
-            self._bind_badge_drag(badge, seat)
+            stat = stats_by_name.get(pname)
+            badge_loading = loading and stat is None
+            host = self._create_badge_host(seat)
+            badge = SeatBadge(
+                host, self.theme, info, stat,
+                density=density, db=self.db, loading=badge_loading,
+                badge_scale=self._badge_scale(),
+            )
+            seat_offset = self._slot_offset(badge_offsets, seat_to_slot, seat)
+            px, py = self._resolve_badge_xy(
+                pos, seat_offset, badge_dx, badge_dy, w, h, badge.W, badge.H,
+            )
+            self._position_badge_host(seat, px, py, badge)
+            self._bind_badge_interaction(badge, seat)
             self._badges[seat] = badge
-        # Delay so newly placed badge HWNDs are fully registered before we walk
-        # the child HWND tree to apply WS_EX_TRANSPARENT
+
+        if self._win and self._win.winfo_exists():
+            self._win.after(50, self._apply_window_interaction)
+
+    def _place_seat_badges(
+        self, seat_map, layout, seat_to_slot, density, badge_dx, badge_dy,
+        badge_offsets, w, h, stats_by_name, loading=False,
+    ):
+        seen_names = set()
+        for seat, info in seat_map.items():
+            if info.get("is_hero"):
+                continue
+            pname = (info.get("name") or "").strip()
+            if not pname or pname in seen_names:
+                continue
+            seen_names.add(pname)
+            pos = layout.get(seat_to_slot.get(seat))
+            if pos is None:
+                continue
+            stat = stats_by_name.get(pname)
+            badge_loading = loading and stat is None
+            host = self._create_badge_host(seat)
+            badge = SeatBadge(
+                host, self.theme, info, stat,
+                density=density, db=self.db, loading=badge_loading,
+                badge_scale=self._badge_scale(),
+            )
+            seat_offset = self._slot_offset(badge_offsets, seat_to_slot, seat)
+            px, py = self._resolve_badge_xy(
+                pos, seat_offset, badge_dx, badge_dy, w, h, badge.W, badge.H,
+            )
+            self._position_badge_host(seat, px, py, badge)
+            self._bind_badge_interaction(badge, seat)
+            self._badges[seat] = badge
         self._win.after(50, self._apply_window_interaction)
+
+    def _apply_loaded_stats(
+        self, generation, seat_map, max_seats, site, hand_id, layout, seat_to_slot,
+        density, badge_dx, badge_dy, badge_offsets, w, h, stats_by_name,
+    ):
+        if generation != self._stats_load_generation:
+            return
+        if self._win is None or not self._win.winfo_exists():
+            return
+        self._sync_seat_badges(
+            seat_map, layout, seat_to_slot, density, badge_dx, badge_dy,
+            badge_offsets, w, h, stats_by_name, loading=False,
+        )
+
+    def refresh_stats_only(self):
+        """Re-read cached player_types for current seats without rebuilding layout."""
+        if not self._last_seat_map:
+            return
+        self._stats_cache.invalidate()
+        self.update_hand(self._last_seat_map, self._last_max_seats, self._current_site)
 
     def hide(self):
         if self._win and self._win.winfo_exists():
             self._win.withdraw()
         if self._toggle_win is not None and self._toggle_win.winfo_exists():
             self._toggle_win.withdraw()
+        for host in self._badge_hosts.values():
+            if host.winfo_exists():
+                host.withdraw()
 
     def show(self):
         if self._win and self._win.winfo_exists():
@@ -3839,16 +4606,21 @@ class LiveHUDOverlay:
         if self._toggle_win is not None and self._toggle_win.winfo_exists():
             self._toggle_win.deiconify()
             self._toggle_win.lift()
+        for host in self._badge_hosts.values():
+            if host.winfo_exists():
+                host.deiconify()
+                host.lift()
 
     def destroy(self):
         self._clear_seat_guides()
+        self._clear_badges()
         if self._win and self._win.winfo_exists():
             self._win.destroy()
         self._win = None
-        self._badges.clear()
         self._summary_panel = None
         self._layout_hint_panel = None
         self._layout_toggle = None
+        self._reset_btn = None
         if self._toggle_win is not None and self._toggle_win.winfo_exists():
             self._toggle_win.destroy()
         self._toggle_win = None
@@ -3877,27 +4649,10 @@ class LiveHUDOverlay:
         self._toggle_win.overrideredirect(True)
         self._toggle_win.attributes("-topmost", True)
         self._toggle_win.configure(bg=_HUD_COLORKEY)
-        toggle_w, toggle_h = 92, 24
+        toggle_w, toggle_h = HUDLayoutToggle.TOOLBAR_W, HUDLayoutToggle.TOOLBAR_H
         self._toggle_win.geometry(f"{toggle_w}x{toggle_h}+0+0")
         self._toggle_win.attributes("-alpha", 0.92)
-        # Apply WS_EX_LAYERED so we can optionally colorkey — but NO WS_EX_TRANSPARENT
-        try:
-            import ctypes
-            self._toggle_win.update_idletasks()
-            inner = self._toggle_win.winfo_id()
-            _ga = ctypes.windll.user32.GetAncestor
-            _ga.restype = ctypes.c_size_t
-            toggle_root = int(_ga(inner, 2)) or inner
-            GWL_EXSTYLE = -20
-            WS_EX_LAYERED = 0x00080000
-            WS_EX_NOACTIVATE = 0x08000000
-            style = ctypes.windll.user32.GetWindowLongW(toggle_root, GWL_EXSTYLE)
-            style |= WS_EX_LAYERED | WS_EX_NOACTIVATE
-            # NO WS_EX_TRANSPARENT — we NEED clicks
-            ctypes.windll.user32.SetWindowLongW(toggle_root, GWL_EXSTYLE, style)
-            ctypes.windll.user32.SetLayeredWindowAttributes(toggle_root, _HUD_COLORKEY_BGR, 0, 1)
-        except Exception:
-            pass
+        _setup_hud_interactive_host(self._toggle_win)
         # Create the HUDLayoutToggle inside this separate window
         if self._layout_toggle is None or not self._layout_toggle.winfo_exists():
             self._layout_toggle = HUDLayoutToggle(
@@ -3906,6 +4661,20 @@ class LiveHUDOverlay:
             )
         self._layout_toggle.place(x=0, y=0, anchor="nw")
         self._layout_toggle.set_layout_mode(self._layout_mode)
+        reset_x = HUDLayoutToggle.W + HUDLayoutToggle.TOOLBAR_GAP
+        if self._reset_btn is None or not self._reset_btn.winfo_exists():
+            self._reset_btn = HUDResetSeatsButton(
+                self._toggle_win, self.theme,
+                on_click=self._reset_all_seat_positions,
+            )
+        self._reset_btn.place(x=reset_x, y=0, anchor="nw")
+        if self.on_quit:
+            if not getattr(self, "_close_btn", None) or not self._close_btn.winfo_exists():
+                self._close_btn = HUDCloseButton(
+                    self._toggle_win, self.theme, on_click=self.on_quit,
+                )
+            close_x = reset_x + HUDResetSeatsButton.W + HUDLayoutToggle.TOOLBAR_GAP
+            self._close_btn.place(x=close_x, y=0, anchor="nw")
         self._toggle_win.lift()
 
     def _reposition_toggle(self):
@@ -3916,8 +4685,10 @@ class LiveHUDOverlay:
             self._toggle_win.withdraw()
             return
         x, y, w, h = self._current_rect
-        toggle_w = HUDLayoutToggle.W
-        toggle_h = HUDLayoutToggle.H
+        toggle_w = HUDLayoutToggle.TOOLBAR_W if self.on_quit else (
+            HUDLayoutToggle.W + HUDLayoutToggle.TOOLBAR_GAP + HUDResetSeatsButton.W
+        )
+        toggle_h = HUDLayoutToggle.TOOLBAR_H
         # Place at top-left corner of poker table window, offset by 6px
         self._toggle_win.geometry(f"{toggle_w}x{toggle_h}+{x+6}+{y+6}")
         self._toggle_win.deiconify()
@@ -4042,7 +4813,7 @@ class LiveHUDOverlay:
                 guide.destroy()
         self._seat_guides.clear()
 
-    def _render_seat_guides(self, layout, seat_map, badge_offsets):
+    def _render_seat_guides(self, layout, seat_map, seat_to_slot, badge_offsets):
         self._clear_seat_guides()
         if not self._layout_mode or self._current_rect is None or self._win is None or not self._win.winfo_exists():
             return
@@ -4052,10 +4823,14 @@ class LiveHUDOverlay:
         for seat, info in seat_map.items():
             if info.get("is_hero"):
                 continue
-            pos = layout.get(seat)
+            slot = seat_to_slot.get(seat)
+            pos = layout.get(slot)
             if pos is None:
                 continue
-            guide = HUDSeatGuide(self._win, self.theme, seat, has_custom_offset=str(seat) in badge_offsets)
+            guide = HUDSeatGuide(
+                self._win, self.theme, seat,
+                has_custom_offset=slot is not None and str(slot) in badge_offsets,
+            )
             base_x = int(pos[0] * w) + badge_dx
             base_y = int(pos[1] * h) + badge_dy
             base_x = max((guide.W // 2) + 6, min(w - (guide.W // 2) - 6, base_x))
@@ -4102,7 +4877,7 @@ class LiveHUDOverlay:
                 "badge_offset": (offset_x, offset_y),
                 "density": global_density,
                 "seat_layout": global_layout,
-                "badge_offsets": {},
+                "badge_offsets": dict(self.settings.get("hud_slot_positions", {})),
             }
 
         effective_site = site_name if preset_choice == "auto" else preset_choice
@@ -4135,6 +4910,11 @@ class LiveHUDOverlay:
 
     def set_layout_mode(self, enabled):
         self._layout_mode = bool(enabled)
+        self.settings["hud_locked"] = not self._layout_mode
+        if self.on_lock_changed:
+            self.on_lock_changed(self.settings)
+        if self.on_quit and hasattr(self.root, "_hud_layout_mode"):
+            self.root._hud_layout_mode = self._layout_mode
         self._apply_window_interaction()
         if not self._layout_mode:
             self._clear_seat_guides()
@@ -4275,57 +5055,91 @@ class LiveHUDOverlay:
         self._summary_origin = None
         self._persist_dragged_profile()
 
-    def _bind_badge_drag(self, badge, seat):
-        badge.bind("<ButtonPress-1>", lambda event, seat_no=seat: self._badge_drag_start(event, seat_no))
-        badge.bind("<B1-Motion>", self._badge_drag_move)
-        badge.bind("<ButtonRelease-1>", lambda event, seat_no=seat: self._badge_drag_end(event, seat_no))
+    def _bind_badge_interaction(self, badge, seat):
+        badge.bind("<ButtonPress-1>", lambda event, seat_no=seat: self._badge_press(event, seat_no))
+        badge.bind("<B1-Motion>", self._badge_motion)
+        badge.bind("<ButtonRelease-1>", lambda event, seat_no=seat: self._badge_release(event, seat_no))
         badge.bind("<Double-Button-1>", lambda event, seat_no=seat: self._reset_badge_offset(seat_no))
+
+    def _badge_press(self, event, seat):
+        badge = self._badges.get(seat)
+        if badge is not None:
+            badge._drag_moved = False
+        if self._layout_mode:
+            self._badge_drag_start(event, seat)
+
+    def _badge_motion(self, event):
+        badge = None
+        if self._badge_drag_state:
+            badge = self._badges.get(self._badge_drag_state.get("seat"))
+        if badge is not None:
+            badge._drag_moved = True
+        if self._layout_mode:
+            self._badge_drag_move(event)
+
+    def _badge_release(self, event, seat):
+        badge = self._badges.get(seat)
+        if self._layout_mode:
+            self._badge_drag_end(event, seat)
+            if badge is not None and not badge._drag_moved:
+                badge.toggle_pinned_stats()
+        elif badge is not None:
+            badge.toggle_pinned_stats()
 
     def _badge_drag_start(self, event, seat):
         if not self._layout_mode:
             return
         badge = self._badges.get(seat)
-        if badge is None:
+        host = self._badge_hosts.get(seat)
+        if badge is None or host is None:
             return
         self._select_target(("seat", seat))
-        info = badge.place_info()
         self._badge_drag_state = {
             "seat": seat,
             "origin": (event.x_root, event.y_root),
-            "position": (int(float(info.get("x", 0))), int(float(info.get("y", 0)))),
+            "position": (host.winfo_x(), host.winfo_y()),
         }
-        badge.lift()
+        host.lift()
 
     def _badge_drag_move(self, event):
         if not self._layout_mode or not self._badge_drag_state or self._current_rect is None:
             return
         seat = self._badge_drag_state["seat"]
         badge = self._badges.get(seat)
-        if badge is None:
+        host = self._badge_hosts.get(seat)
+        if badge is None or host is None:
             return
         dx = event.x_root - self._badge_drag_state["origin"][0]
         dy = event.y_root - self._badge_drag_state["origin"][1]
-        x = self._badge_drag_state["position"][0] + dx
-        y = self._badge_drag_state["position"][1] + dy
+        nx = self._badge_drag_state["position"][0] + dx
+        ny = self._badge_drag_state["position"][1] + dy
         _, _, w, h = self._current_rect
-        x = max((badge.W // 2) + 6, min(w - (badge.W // 2) - 6, x))
-        y = max((badge.H // 2) + 6, min(h - (badge.H // 2) - 6, y))
-        badge.place(x=x, y=y, anchor="center")
+        px, py = self._overlay_xy_from_host_at(nx, ny, badge)
+        px, py = clamp_badge_position(
+            px, py, badge.W, badge.H, w, h, self._edge_margin_pct(),
+        )
+        self._position_badge_host(seat, px, py, badge)
+
+    def _overlay_xy_from_host_at(self, host_x, host_y, badge):
+        tx, ty, _, _ = self._current_rect
+        px = host_x - tx + (badge.W // 2)
+        py = host_y - ty
+        return px, py
 
     def _badge_drag_end(self, event, seat):
         if not self._layout_mode or not self._badge_drag_state:
             return
         self._badge_drag_move(event)
         badge = self._badges.get(seat)
-        if badge and self._current_rect:
+        host = self._badge_hosts.get(seat)
+        slot = self._layout_slot_for_seat(seat)
+        if badge and host and self._current_rect and slot is not None:
             _, _, w, h = self._current_rect
-            # badge.place uses anchor="center", so winfo_x/y gives top-left corner
-            bx = badge.winfo_x() + badge.winfo_width() // 2
-            by = badge.winfo_y() + badge.winfo_height() // 2
-            fx = max(0.0, min(1.0, bx / w))
-            fy = max(0.0, min(1.0, by / h))
+            px, py = self._overlay_xy_from_host(host, badge)
+            fx = max(0.0, min(1.0, px / w))
+            fy = max(0.0, min(1.0, py / h))
             self._badge_drag_state = None
-            self._persist_fraction_badge_profile(seat, fx, fy)
+            self._persist_fraction_badge_profile(slot, fx, fy)
         else:
             self._badge_drag_state = None
 
@@ -4382,21 +5196,23 @@ class LiveHUDOverlay:
         if isinstance(self._selected_target, tuple) and len(self._selected_target) == 2:
             seat = self._selected_target[1]
             badge = self._badges.get(seat)
-            if badge is None or not badge.winfo_exists():
+            host = self._badge_hosts.get(seat)
+            if badge is None or not badge.winfo_exists() or host is None:
                 return
-            info = badge.place_info()
-            x = int(float(info.get("x", 0))) + dx
-            y = int(float(info.get("y", 0))) + dy
+            px, py = self._overlay_xy_from_host(host, badge)
+            px += dx
+            py += dy
             _, _, w, h = self._current_rect
-            x = max((badge.W // 2) + 6, min(w - (badge.W // 2) - 6, x))
-            y = max((badge.H // 2) + 6, min(h - (badge.H // 2) - 6, y))
-            badge.place(x=x, y=y, anchor="center")
-            # Save as fraction so position scales with window resize
-            bx = badge.winfo_x() + badge.winfo_width() // 2
-            by = badge.winfo_y() + badge.winfo_height() // 2
-            fx = max(0.0, min(1.0, bx / w))
-            fy = max(0.0, min(1.0, by / h))
-            self._persist_fraction_badge_profile(seat, fx, fy)
+            px, py = clamp_badge_position(
+                px, py, badge.W, badge.H, w, h, self._edge_margin_pct(),
+            )
+            self._position_badge_host(seat, px, py, badge)
+            slot = self._layout_slot_for_seat(seat)
+            if slot is None:
+                return
+            fx = max(0.0, min(1.0, px / w))
+            fy = max(0.0, min(1.0, py / h))
+            self._persist_fraction_badge_profile(slot, fx, fy)
 
     def _reset_selected_target(self):
         if not self._layout_mode:
@@ -4441,15 +5257,17 @@ class LiveHUDOverlay:
         if seat_pos is None:
             return
 
-        info = badge.place_info()
-        actual_x = int(float(info.get("x", 0)))
-        actual_y = int(float(info.get("y", 0)))
+        host = self._badge_hosts.get(seat)
+        if host is None:
+            return
+        actual_x, actual_y = self._overlay_xy_from_host(host, badge)
         _, _, w, h = self._current_rect
         badge_dx, badge_dy = profile.get("badge_offset", (0, 0))
         base_x = int(seat_pos[0] * w) + badge_dx
         base_y = int(seat_pos[1] * h) + badge_dy
-        base_x = max((badge.W // 2) + 6, min(w - (badge.W // 2) - 6, base_x))
-        base_y = max((badge.H // 2) + 6, min(h - (badge.H // 2) - 6, base_y))
+        base_x, base_y = clamp_badge_position(
+            base_x, base_y, badge.W, badge.H, w, h, self._edge_margin_pct(),
+        )
         offset_x = actual_x - base_x
         offset_y = actual_y - base_y
 
@@ -4475,57 +5293,32 @@ class LiveHUDOverlay:
         if self._last_seat_map:
             self.update_hand(self._last_seat_map, self._last_max_seats, self._current_site)
 
-    def _persist_fraction_badge_profile(self, seat, fx, fy):
+    def _persist_fraction_badge_profile(self, slot, fx, fy):
         """Save badge position as a fraction of the overlay window (scales on resize)."""
         profile = self._get_site_profile(self._current_site)
-        profile_site = profile.get("profile_site")
-        if not profile_site:
-            return
-        existing_profile = dict(self.settings.setdefault("hud_site_profiles", {}).get(profile_site, {}))
-        badge_offsets = dict(existing_profile.get("badge_offsets", profile.get("badge_offsets", {})))
-        badge_offsets[str(seat)] = {"fx": round(fx, 4), "fy": round(fy, 4)}
-        summary_offset = profile.get("summary_offset", (0, 0))
-        saved_profile = {
-            "anchor": existing_profile.get("anchor", profile.get("anchor", self.settings.get("hud_anchor", "top-left"))),
-            "offset_x": existing_profile.get("offset_x", summary_offset[0]),
-            "offset_y": existing_profile.get("offset_y", summary_offset[1]),
-            "density": existing_profile.get("density", profile.get("density", self.settings.get("hud_density", "standard"))),
-            "seat_layout": existing_profile.get("seat_layout", profile.get("seat_layout", self.settings.get("hud_seat_layout", "auto"))),
-            "badge_offsets": badge_offsets,
-        }
-        self.settings.setdefault("hud_site_profiles", {})[profile_site] = saved_profile
-        if self.on_profile_changed:
-            self.on_profile_changed(profile_site, saved_profile)
-        if self._last_seat_map:
-            self.update_hand(self._last_seat_map, self._last_max_seats, self._current_site)
+        existing_offsets = dict(profile.get("badge_offsets", {}))
+        existing_offsets[str(slot)] = {"fx": round(fx, 4), "fy": round(fy, 4)}
+        self._persist_badge_offsets(profile, existing_offsets)
 
     def _reset_badge_offset(self, seat):
         if not self._layout_mode:
             return
         self._select_target(("seat", seat))
+        slot = self._layout_slot_for_seat(seat)
+        if slot is None:
+            return
         profile = self._get_site_profile(self._current_site)
-        profile_site = profile.get("profile_site")
-        if not profile_site:
+        existing_offsets = dict(profile.get("badge_offsets", {}))
+        if str(slot) not in existing_offsets:
             return
-        existing_profile = dict(self.settings.setdefault("hud_site_profiles", {}).get(profile_site, {}))
-        badge_offsets = dict(existing_profile.get("badge_offsets", profile.get("badge_offsets", {})))
-        if str(seat) not in badge_offsets:
+        existing_offsets.pop(str(slot), None)
+        self._persist_badge_offsets(profile, existing_offsets)
+
+    def _reset_all_seat_positions(self):
+        profile = self._get_site_profile(self._current_site)
+        if not profile.get("badge_offsets"):
             return
-        badge_offsets.pop(str(seat), None)
-        summary_offset = profile.get("summary_offset", (0, 0))
-        saved_profile = {
-            "anchor": existing_profile.get("anchor", profile.get("anchor", self.settings.get("hud_anchor", "top-left"))),
-            "offset_x": existing_profile.get("offset_x", summary_offset[0]),
-            "offset_y": existing_profile.get("offset_y", summary_offset[1]),
-            "density": existing_profile.get("density", profile.get("density", self.settings.get("hud_density", "standard"))),
-            "seat_layout": existing_profile.get("seat_layout", profile.get("seat_layout", self.settings.get("hud_seat_layout", "auto"))),
-            "badge_offsets": badge_offsets,
-        }
-        self.settings.setdefault("hud_site_profiles", {})[profile_site] = saved_profile
-        if self.on_profile_changed:
-            self.on_profile_changed(profile_site, saved_profile)
-        if self._last_seat_map:
-            self.update_hand(self._last_seat_map, self._last_max_seats, self._current_site)
+        self._persist_badge_offsets(profile, {})
 
 
 # ─── Hand Replayer ────────────────────────────────────────────────────────────
@@ -5010,10 +5803,14 @@ class HandReplayerWindow:
 
 # ─── GUI Application ──────────────────────────────────────────────────────────
 class PokerApp(ctk.CTk):
-    def __init__(self):
+    def __init__(self, hud_only: bool = False):
         super().__init__()
-        self.title("Poker Tracker")
-        self.geometry("1280x800")
+        self._hud_only = hud_only
+        self.title("LeakSnipe Live HUD" if hud_only else "Poker Tracker")
+        if hud_only:
+            self.withdraw()
+        else:
+            self.geometry("1280x800")
         self.settings = load_settings()
         self.theme_name = self.settings.get("theme", "Slate Blue")
         self.theme = THEMES.get(self.theme_name, THEMES["Slate Blue"])
@@ -5054,7 +5851,7 @@ class PokerApp(ctk.CTk):
 
         # ── AI Engine ─────────────────────────────────────────────────────
         self.ai_processor = None
-        if HAS_AI_ENGINE:
+        if HAS_AI_ENGINE and not hud_only:
             try:
                 self.ai_processor = AIProcessor()
             except Exception:
@@ -5067,15 +5864,26 @@ class PokerApp(ctk.CTk):
         self._live_hud_on = False
         self._hud_layout_mode = False
 
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
-        self._start_ocr_capture_bridge()
-        self._start_ocr_hotkeys()
-        self._schedule_ocr_bridge_poll()
-        self._initial_scan()
+        self._quit_hotkey_id = 2
+        if hud_only:
+            _write_hud_pid()
+            self.protocol("WM_DELETE_WINDOW", self._on_hud_only_close)
+            self.bind_all("<Escape>", self._on_hud_escape)
+            self._start_quit_hotkey_listener()
+        else:
+            self._build_ui()
+            self.protocol("WM_DELETE_WINDOW", self._on_app_close)
+            self._start_ocr_capture_bridge()
+            self._start_ocr_hotkeys()
+            self._schedule_ocr_bridge_poll()
+        if hud_only:
+            self._hud_only_startup()
+        else:
+            self._initial_scan()
 
-        if self.settings.get("live_hud_enabled", False):
-            self.after(2000, self._start_live_hud)
+        if hud_only or self.settings.get("live_hud_enabled", False):
+            delay = 800 if hud_only else 2000
+            self.after(delay, self._start_live_hud)
 
     # ── UI Construction ───────────────────────────────────────────────────
     def _build_ui(self):
@@ -6492,6 +7300,80 @@ class PokerApp(ctk.CTk):
             pass
         self.destroy()
 
+    def _on_hud_escape(self, event=None):
+        overlays = list(getattr(self, "_hud_overlays", {}).values())
+        if self._hud_layout_mode or any(getattr(o, "_layout_mode", False) for o in overlays):
+            self._hud_layout_mode = False
+            for overlay in overlays:
+                try:
+                    overlay.set_layout_mode(False)
+                except Exception:
+                    pass
+            return "break"
+        self._on_hud_only_close()
+        return "break"
+
+    def _start_quit_hotkey_listener(self):
+        import threading
+
+        def _listen():
+            try:
+                import ctypes
+                import ctypes.wintypes
+                MOD_CONTROL = 0x0002
+                MOD_SHIFT = 0x0004
+                VK_Q = 0x51
+                WM_HOTKEY = 0x0312
+                ctypes.windll.user32.RegisterHotKey(
+                    None, self._quit_hotkey_id, MOD_CONTROL | MOD_SHIFT, VK_Q,
+                )
+                msg = ctypes.wintypes.MSG()
+                while getattr(self, "_live_hud_on", True):
+                    ret = ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                    if ret <= 0:
+                        break
+                    if msg.message == WM_HOTKEY and msg.wParam == self._quit_hotkey_id:
+                        self.after(0, self._on_hud_only_close)
+                    ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+                    ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+            except Exception:
+                pass
+            finally:
+                try:
+                    import ctypes
+                    ctypes.windll.user32.UnregisterHotKey(None, self._quit_hotkey_id)
+                except Exception:
+                    pass
+
+        self._quit_hotkey_thread = threading.Thread(target=_listen, daemon=True)
+        self._quit_hotkey_thread.start()
+
+    def _request_hud_quit(self):
+        if self._hud_only:
+            self._on_hud_only_close()
+
+    def _on_hud_only_close(self):
+        if getattr(self, "_hud_closing", False):
+            return
+        self._hud_closing = True
+        self._stop_live_hud()
+        try:
+            self.importer.stop_watcher()
+        except Exception:
+            pass
+        job = getattr(self, "_hud_cache_refresh_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        _remove_hud_pid()
+        try:
+            self.quit()
+        except Exception:
+            pass
+        self.destroy()
+
     def _build_ai_tab(self):
         tab = self.tab_ai
         t = self.theme
@@ -6881,6 +7763,25 @@ class PokerApp(ctk.CTk):
         ctk.CTkEntry(hud_row5, textvariable=self.hud_offset_y_var, fg_color=self.theme["bg_input"],
                      text_color=self.theme["text"], width=60).pack(side="left", padx=4)
 
+        hud_row6 = ctk.CTkFrame(hud_frame, fg_color=self.theme["bg_panel"])
+        hud_row6.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(hud_row6, text="Badge scale:", text_color=self.theme["text"], width=80).pack(side="left")
+        self.hud_badge_scale_var = ctk.StringVar(value=str(self.settings.get("hud_badge_scale", 1.5)))
+        ctk.CTkEntry(hud_row6, textvariable=self.hud_badge_scale_var, fg_color=self.theme["bg_input"],
+                     text_color=self.theme["text"], width=60).pack(side="left", padx=4)
+        ctk.CTkLabel(hud_row6, text="Edge margin %:", text_color=self.theme["text"], width=100).pack(side="left", padx=(14, 0))
+        self.hud_edge_margin_var = ctk.StringVar(value=str(int(float(self.settings.get("hud_edge_margin_pct", 0.12)) * 100)))
+        ctk.CTkEntry(hud_row6, textvariable=self.hud_edge_margin_var, fg_color=self.theme["bg_input"],
+                     text_color=self.theme["text"], width=60).pack(side="left", padx=4)
+
+        ctk.CTkLabel(
+            hud_frame,
+            text="Badges avoid left/right screen edges for BetACR action buttons and side info panels. "
+                 "Badge scale 1.5 = 50% larger; edge margin % keeps badges inset horizontally.",
+            text_color=self.theme["text_dim"],
+            font=_F_DATA,
+        ).pack(anchor="w", padx=10, pady=(2, 4))
+
         ctk.CTkLabel(
             hud_frame,
             text="Site preset can reposition the summary card and shift all badges by poker client. Manual offset applies on top.",
@@ -6935,7 +7836,7 @@ class PokerApp(ctk.CTk):
         self.live_hud_btn.pack(side="left", padx=3, pady=3)
 
         self.hud_layout_btn = self._action_button(
-            self.taskbar, "Layout Mode", self._toggle_hud_layout_mode, tone="accent", width=100
+            self.taskbar, "Unlock HUD", self._toggle_hud_layout_mode, tone="accent", width=100
         )
         self.hud_layout_btn.pack(side="left", padx=3, pady=3)
 
@@ -7068,6 +7969,51 @@ class PokerApp(ctk.CTk):
         except Exception:
             pass
 
+    def _hud_only_startup(self):
+        """Lightweight startup for --live-hud: watcher only, no full GUI scan."""
+        logging.info("HUD-only mode: incremental watcher (skipping full hand scan)")
+        self._prewarm_hud_stats_async()
+        if self.settings.get("auto_refresh", True):
+            self.importer.start_watcher(callback=self._hud_watcher_callback)
+
+    def _hud_watcher_callback(self, new_count, file_count):
+        if new_count:
+            self.after(0, self._schedule_hud_cache_refresh)
+            monitor = getattr(self, "hand_monitor", None)
+            if monitor is not None:
+                self.after(400, monitor.check_now)
+
+    def _schedule_hud_cache_refresh(self):
+        if getattr(self, "_hud_cache_refresh_job", None) is not None:
+            try:
+                self.after_cancel(self._hud_cache_refresh_job)
+            except Exception:
+                pass
+        self._hud_cache_refresh_job = self.after(2000, self._refresh_hud_player_cache)
+
+    def _refresh_hud_player_cache(self):
+        self._hud_cache_refresh_job = None
+        threading.Thread(target=self._compute_players_bg, daemon=True).start()
+        for overlay in list(getattr(self, "_hud_overlays", {}).values()):
+            try:
+                overlay.invalidate_stats_cache()
+                overlay.refresh_stats_only()
+            except Exception:
+                pass
+
+    def _prewarm_hud_stats_async(self):
+        threading.Thread(target=self._prewarm_hud_stats, daemon=True).start()
+
+    def _prewarm_hud_stats(self):
+        try:
+            if self.db.count_player_types() > 0:
+                logging.info("HUD stats cache warm (%d players in player_types)", self.db.count_player_types())
+                return
+            logging.info("HUD stats cache empty — computing player_types in background")
+            self._compute_players_bg()
+        except Exception:
+            logging.exception("HUD stats prewarm failed")
+
     # ── Actions / Callbacks ───────────────────────────────────────────────
     def _initial_scan(self):
         self._set_status("Scanning hand history directories...")
@@ -7119,6 +8065,9 @@ class PokerApp(ctk.CTk):
         self._last_hands_snapshot = hands
         self.current_stats = stats
         self._set_status(status_text)
+        if getattr(self, "_hud_only", False):
+            threading.Thread(target=self._compute_players_bg, daemon=True).start()
+            return
         dash_fp = (
             stats.get("total_hands"),
             stats.get("vpip"),
@@ -7159,7 +8108,12 @@ class PokerApp(ctk.CTk):
         threading.Thread(target=_do_import, daemon=True).start()
 
     def _set_status(self, text):
-        self.status_bar.configure(text=text)
+        if hasattr(self, "status_bar") and self.status_bar is not None:
+            try:
+                self.status_bar.configure(text=text)
+            except Exception:
+                pass
+        logging.info("Status: %s", text)
 
     def _update_dashboard(self):
         self._update_dashboard_with_hands(self.importer.get_hands())
@@ -9008,6 +9962,14 @@ class PokerApp(ctk.CTk):
             self.settings["hud_offset_y"] = int(self.hud_offset_y_var.get())
         except ValueError:
             self.settings["hud_offset_y"] = 0
+        try:
+            self.settings["hud_badge_scale"] = float(self.hud_badge_scale_var.get())
+        except ValueError:
+            self.settings["hud_badge_scale"] = 1.5
+        try:
+            self.settings["hud_edge_margin_pct"] = float(self.hud_edge_margin_var.get()) / 100.0
+        except ValueError:
+            self.settings["hud_edge_margin_pct"] = 0.12
 
         self.settings = normalize_settings(self.settings)
         self._refresh_dir_list()
@@ -9106,9 +10068,10 @@ class PokerApp(ctk.CTk):
         updated_profile = dict(profile)
         updated_profile["badge_offsets"] = {}
         self.settings.setdefault("hud_site_profiles", {})[site] = updated_profile
+        self.settings["hud_slot_positions"] = {}
         self.settings = normalize_settings(self.settings)
         save_settings(self.settings)
-        self.hud_profile_status.configure(text=f"Cleared badge nudges for {site}")
+        self.hud_profile_status.configure(text=f"Cleared seat positions for {site}")
         if self.live_hud_overlay and self._live_hud_on:
             self.live_hud_overlay.settings = self.settings
             self.live_hud_overlay.update_hand(
@@ -9116,6 +10079,10 @@ class PokerApp(ctk.CTk):
                 self.live_hud_overlay._last_max_seats,
                 self.live_hud_overlay._current_site,
             )
+
+    def _handle_hud_lock_changed(self, settings):
+        self.settings = normalize_settings(settings)
+        save_settings(self.settings)
 
     def _handle_hud_profile_changed(self, site, profile):
         self.settings.setdefault("hud_site_profiles", {})[site] = profile
@@ -9128,17 +10095,17 @@ class PokerApp(ctk.CTk):
 
     def _toggle_hud_layout_mode(self):
         if not self._live_hud_on or not getattr(self, '_hud_overlays', {}):
-            self._set_status("Start Live HUD first, then enter Layout Mode to drag the overlay.")
+            self._set_status("Start Live HUD first, then unlock the HUD to drag seat badges.")
             return
         self._hud_layout_mode = not self._hud_layout_mode
         for overlay in getattr(self, '_hud_overlays', {}).values():
             overlay.set_layout_mode(self._hud_layout_mode)
         if self._hud_layout_mode:
-            self.hud_layout_btn.configure(text="Lock Layout", fg_color=self.theme["orange"], text_color=self.theme["bg_base"])
-            self._set_status("Layout Mode enabled — drag the summary card or badges, or click a seat guide to reset one nudge.")
+            self.hud_layout_btn.configure(text="Lock HUD", fg_color=self.theme["orange"], text_color=self.theme["bg_base"])
+            self._set_status("Drag mode — drag seat badges, then Lock HUD for click-through play.")
         else:
-            self.hud_layout_btn.configure(text="Layout Mode", fg_color=self.theme["gold"], text_color=self.theme["bg_base"])
-            self._set_status("Layout Mode disabled.")
+            self.hud_layout_btn.configure(text="Unlock HUD", fg_color=self.theme["gold"], text_color=self.theme["bg_base"])
+            self._set_status("HUD locked — overlay is click-through for poker play.")
 
     # ── Live HUD Actions ──────────────────────────────────────────────────
     def _toggle_live_hud(self):
@@ -9149,42 +10116,67 @@ class PokerApp(ctk.CTk):
 
     def _start_live_hud(self):
         if not HAS_WIN32:
-            logging.error("HUD FAIL: HAS_WIN32 is False — pywin32 not available in this build")
+            msg = (
+                "Live HUD requires pywin32.\n"
+                "Run: pip install pywin32\n"
+                "Then restart LeakSnipe Live HUD."
+            )
+            logging.error("HUD FAIL: HAS_WIN32 is False — pywin32 not available")
+            _show_hud_error("LeakSnipe Live HUD", msg)
             self._set_status("Live HUD requires pywin32 — run: pip install pywin32")
             return
 
         logging.info(f"HUD START: HAS_WIN32={HAS_WIN32}, cwd={os.getcwd()}")
         self._live_hud_on = True
         self._hud_overlays: dict = {}  # hwnd → LiveHUDOverlay
+        self._prewarm_hud_stats_async()
 
-        self.live_hud_btn.configure(
-            fg_color=self.theme["green"],
-            text_color=self.theme["bg_base"],
-            text="⬡ HUD ON",
-        )
-        self._hud_layout_mode = False
-        self.hud_layout_btn.configure(text="Layout Mode", fg_color=self.theme["gold"], text_color=self.theme["bg_base"])
+        if hasattr(self, "live_hud_btn"):
+            self.live_hud_btn.configure(
+                fg_color=self.theme["green"],
+                text_color=self.theme["bg_base"],
+                text="⬡ HUD ON",
+            )
+        self._hud_layout_mode = not bool(self.settings.get("hud_locked", True))
+        if hasattr(self, "hud_layout_btn"):
+            if self._hud_layout_mode:
+                self.hud_layout_btn.configure(
+                    text="Lock HUD", fg_color=self.theme["orange"], text_color=self.theme["bg_base"]
+                )
+            else:
+                self.hud_layout_btn.configure(
+                    text="Unlock HUD", fg_color=self.theme["gold"], text_color=self.theme["bg_base"]
+                )
 
         def _get_or_create_overlay(hwnd):
             if hwnd not in self._hud_overlays:
                 overlay = LiveHUDOverlay(
                     self, self.theme, self.db, self.settings,
                     on_profile_changed=self._handle_hud_profile_changed,
+                    on_quit=self._request_hud_quit if self._hud_only else None,
+                    on_lock_changed=self._handle_hud_lock_changed,
                 )
                 self._hud_overlays[hwnd] = overlay
                 self.live_hud_overlay = overlay
             return self._hud_overlays[hwnd]
 
-        def _on_table_added(hwnd, rect):
+        def _on_table_added(hwnd, rect, title=""):
             def _do():
                 overlay = _get_or_create_overlay(hwnd)
+                overlay.bind_table(title)
                 overlay.update_rect(rect)
+                if self.hand_monitor:
+                    self.hand_monitor.register_window(hwnd, title)
+                    self.hand_monitor.check_now()
                 n = len(self._hud_overlays)
-                self._set_status(f"Live HUD active — {n} table(s) detected.")
+                label = title or self.table_detector.get_window_title(hwnd)
+                self._set_status(f"Live HUD on ACR table — {n} table(s). {label[:60]}")
             self.after(0, _do)
 
         def _on_table_removed(hwnd):
             def _do():
+                if self.hand_monitor:
+                    self.hand_monitor.unregister_window(hwnd)
                 overlay = self._hud_overlays.pop(hwnd, None)
                 if overlay:
                     try:
@@ -9193,45 +10185,88 @@ class PokerApp(ctk.CTk):
                         pass
                 self.live_hud_overlay = next(iter(self._hud_overlays.values()), None)
                 n = len(self._hud_overlays)
-                self._set_status(f"Table closed. HUD active on {n} table(s).")
+                if n == 0:
+                    self._set_status("No ACR table found — HUD hidden.")
+                else:
+                    self._set_status(f"Table closed. HUD active on {n} table(s).")
             self.after(0, _do)
 
-        def _on_table_moved(hwnd, rect):
+        def _on_table_moved(hwnd, rect, title=""):
             def _do():
                 overlay = self._hud_overlays.get(hwnd)
                 if overlay:
+                    if title:
+                        overlay.bind_table(title)
                     overlay.update_rect(rect)
             self.after(0, _do)
 
-        def _on_hand(hand_id, seat_map, max_seats, site):
-            def _do(s=seat_map, n=max_seats, site_name=site):
-                for overlay in list(self._hud_overlays.values()):
-                    overlay.update_hand(s, n, site_name)
+        def _on_table_switched(hwnd, old_title, new_title, rect):
+            def _do():
+                overlay = self._hud_overlays.get(hwnd)
+                if overlay:
+                    overlay.reset_for_table_switch()
+                    overlay.bind_table(new_title)
+                    overlay.update_rect(rect)
+                if self.hand_monitor:
+                    self.hand_monitor.register_window(hwnd, new_title)
+                    self.hand_monitor.check_now()
+                self._set_status(f"Table switch — HUD re-anchored ({new_title[:48]})")
+            self.after(0, _do)
+
+        def _on_hand_update(hwnd, hand_id, seat_map, max_seats, site, table_name):
+            def _do(h=hwnd, hid=hand_id, s=seat_map, n=max_seats, site_name=site):
+                overlay = self._hud_overlays.get(h)
+                if overlay:
+                    overlay.update_hand(s, n, site_name, hand_id=hid)
             self.after(0, _do)
 
         self.table_detector = MultiTableDetector(
             on_table_added=_on_table_added,
             on_table_removed=_on_table_removed,
             on_table_moved=_on_table_moved,
+            on_table_switched=_on_table_switched,
         )
         self.hand_monitor = MultiHandMonitor(
             db=self.db,
             settings=self.settings,
-            on_new_hand=_on_hand,
+            on_hand_update=_on_hand_update,
+            poll_interval=2.0,
         )
         self.table_detector.start()
         self.hand_monitor.start()
-        self._set_status("Live HUD started — scanning for poker windows...")
+        self._set_status("Live HUD started — scanning for ACR tournament tables...")
+        self._schedule_hud_stats_refresh()
+
+        # Immediate scan so overlay appears without waiting for poll interval
+        try:
+            for hwnd, info in self.table_detector.find_all_windows().items():
+                _on_table_added(hwnd, info[:4], info[4])
+        except Exception:
+            logging.exception("HUD initial table scan failed")
+
+    def _schedule_hud_stats_refresh(self):
+        if not self._live_hud_on:
+            return
+        for overlay in list(getattr(self, "_hud_overlays", {}).values()):
+            try:
+                overlay.refresh_stats_only()
+            except Exception:
+                pass
+        self.after(30000, self._schedule_hud_stats_refresh)
 
     def _stop_live_hud(self):
         self._live_hud_on = False
         self._hud_layout_mode = False
-        self.live_hud_btn.configure(
-            fg_color=self.theme["bg_accent"],
-            text_color=self.theme["text"],
-            text="⬡ Live HUD",
-        )
-        self.hud_layout_btn.configure(text="Layout Mode", fg_color=self.theme["gold"], text_color=self.theme["bg_base"])
+        if hasattr(self, "live_hud_btn"):
+            self.live_hud_btn.configure(
+                fg_color=self.theme["bg_accent"],
+                text_color=self.theme["text"],
+                text="⬡ Live HUD",
+            )
+        if hasattr(self, "hud_layout_btn"):
+            self.hud_layout_btn.configure(
+                text="Unlock HUD", fg_color=self.theme["gold"], text_color=self.theme["bg_base"]
+            )
         if self.table_detector:
             self.table_detector.stop()
             self.table_detector = None
@@ -9252,5 +10287,12 @@ class PokerApp(ctk.CTk):
 if __name__ == "__main__":
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("dark-blue")
-    app = PokerApp()
-    app.mainloop()
+    hud_only = "--live-hud" in sys.argv
+    try:
+        app = PokerApp(hud_only=hud_only)
+        app.mainloop()
+    except Exception as exc:
+        logging.exception("Fatal HUD/GUI startup error")
+        title = "LeakSnipe Live HUD" if hud_only else "LeakSnipe"
+        _show_hud_error(title, f"{exc}\n\nAlso see: {LOG_PATH}")
+        sys.exit(1)

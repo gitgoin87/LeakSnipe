@@ -29,20 +29,71 @@
     }
   ],
   "auto_refresh": true,
-  "refresh_interval": 5,
+  "refresh_interval": 10,
   "theme": "Slate Blue",
   "advanced_mode": false,
-  "live_hud_enabled": false,
-  "hud_opacity": 0.75,
-  "hud_seat_layout": "9max",
+  "live_hud_enabled": true,
+  "hud_opacity": 0.6,
+  "hud_seat_layout": "auto",
   "hud_density": "compact",
   "hud_site_preset": "auto",
   "hud_anchor": "top-left",
   "hud_offset_x": 0,
   "hud_offset_y": 0,
-  "hud_site_profiles": {},
+  "hud_edge_margin_pct": 0.05,
+  "hud_badge_scale": 1.8,
+  "hud_locked": true,
+  "hud_slot_positions": {},
+  "hud_site_profiles": {
+    "BetACR": {
+      "anchor": "top-left",
+      "density": "compact",
+      "seat_layout": "auto",
+      "offset_x": 36,
+      "offset_y": 65,
+      "badge_offsets": {
+        "3": {
+          "fx": 0.1619,
+          "fy": 0.4057
+        },
+        "8": {
+          "fx": 0.7293,
+          "fy": 0.6276
+        },
+        "2": {
+          "fx": 0.2758,
+          "fy": 0.6245
+        },
+        "6": {
+          "fx": 0.7874,
+          "fy": 0.1788
+        },
+        "4": {
+          "fx": 0.213,
+          "fy": 0.1233
+        },
+        "7": {
+          "fx": 0.8393,
+          "fy": 0.442
+        },
+        "5": {
+          "fx": 0.4985,
+          "fy": 0.0617
+        }
+      }
+    }
+  },
+  "live_hud_backend": "python",
+  "ai_provider": "asi1",
+  "ollama_model": "qwen2.5:7b",
+  "ai_include_dataset_context": true,
+  "ai_web_search_mode": "on_demand",
+  "ai_include_web_context": true,
+  "ai_personalization": true,
+  "ai_agentic_tools": true,
+  "asi1_model": "asi1",
+  "coach_memory_hero": "JohnDaWalka",
   "db_path": "poker_hands.db",
   "dh2_auto_sync": false,
-  "dh2_sync_interval": 5,
-  "ai_provider": "ollama"
+  "dh2_sync_interval": 5
 }

@@ -5,6 +5,19 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "opener:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    "allow-get-api-base-url",
+    "allow-sidecar-status",
+    "allow-restart-sidecar",
+    "allow-launch-sidecar-window",
+    "allow-hud-start",
+    "allow-hud-stop",
+    "allow-hud-is-running",
+    "allow-hud-diagnose",
+    "allow-launch-python-hud",
+    "allow-stop-python-hud",
+    "allow-is-python-hud-running"
   ]
 }

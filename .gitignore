@@ -7,6 +7,7 @@ dist-*/
 
 # Python
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 *.so
@@ -38,11 +39,20 @@ secrets/
 Thumbs.db
 *.log
 
+# Model weights (train locally)
+models/
+models/*.npz
+models/*.pt
+models/*.meta.json
+
 # Database & Temp
 *.db-journal
+*.db-wal
+*.db-shm
 *.tmp
 *.temp
 poker_debug.log
+coach_memory.db
 
 # Old builds
 *.exe.old
@@ -54,6 +64,13 @@ test_*.py
 artifacts/
 ai_outputs/
 hud_debug.log
+
+# Tauri / Rust build artifacts
+leaksnipe-ui/src-tauri/target/
+leak-snipe-desktop/src-tauri/target/
+
+# Local debug scratch scripts
+_debug*.py
 
 # Node / Electron
 node_modules/

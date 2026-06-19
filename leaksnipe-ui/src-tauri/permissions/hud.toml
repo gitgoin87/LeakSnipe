@@ -1,0 +1,54 @@
+[[permission]]
+identifier = "allow-hud-start"
+description = "Enables the hud_start command"
+commands.allow = ["hud_start"]
+
+[[permission]]
+identifier = "allow-hud-stop"
+description = "Enables the hud_stop command"
+commands.allow = ["hud_stop"]
+
+[[permission]]
+identifier = "allow-hud-is-running"
+description = "Enables the hud_is_running command"
+commands.allow = ["hud_is_running"]
+
+[[permission]]
+identifier = "allow-hud-diagnose"
+description = "Enables the hud_diagnose command"
+commands.allow = ["hud_diagnose"]
+
+[[permission]]
+identifier = "allow-launch-python-hud"
+description = "Enables the launch_python_hud command"
+commands.allow = ["launch_python_hud"]
+
+[[permission]]
+identifier = "allow-stop-python-hud"
+description = "Enables the stop_python_hud command"
+commands.allow = ["stop_python_hud"]
+
+[[permission]]
+identifier = "allow-is-python-hud-running"
+description = "Enables the is_python_hud_running command"
+commands.allow = ["is_python_hud_running"]
+
+[[permission]]
+identifier = "allow-get-api-base-url"
+description = "Enables the get_api_base_url command"
+commands.allow = ["get_api_base_url"]
+
+[[permission]]
+identifier = "allow-sidecar-status"
+description = "Enables the sidecar_status command"
+commands.allow = ["sidecar_status"]
+
+[[permission]]
+identifier = "allow-restart-sidecar"
+description = "Enables the restart_sidecar command"
+commands.allow = ["restart_sidecar"]
+
+[[permission]]
+identifier = "allow-launch-sidecar-window"
+description = "Enables the launch_sidecar_window command"
+commands.allow = ["launch_sidecar_window"]

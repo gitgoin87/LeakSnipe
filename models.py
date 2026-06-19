@@ -182,6 +182,30 @@ class HandDatabase:
             finally:
                 conn.close()
 
+    def hand_needs_hero_backfill(self, hand_id: str) -> bool:
+        """True when stored hero cards or position are missing."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT hero_cards, hero_position FROM hands WHERE hand_id = ?",
+                    (hand_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                cards = (row[0] or "").strip()
+                position = (row[1] or "").strip()
+                return not cards or not position or position == "?"
+            finally:
+                conn.close()
+
+    @staticmethod
+    def hand_has_hero_fields(hand: Hand) -> bool:
+        """True when a parsed hand has usable hero cards and position."""
+        cards = (hand.hero_cards or "").strip()
+        position = (hand.hero_position or "").strip()
+        return bool(cards) and bool(position) and position != "?"
+
     def save_hand(self, hand: Hand, source_file: str = "") -> None:
         """Save a hand to the database."""
         with self.lock:
@@ -636,6 +660,45 @@ class HandDatabase:
                     "fold_cbet": row[6], "wtsd": row[7],
                     "effective_type": row[1] if row[1] else row[0],
                 }
+            finally:
+                conn.close()
+
+    def get_player_types_batch(self, names: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetch cached HUD stats for multiple players in one query."""
+        if not names:
+            return {}
+        unique = list(dict.fromkeys(n for n in names if n))
+        if not unique:
+            return {}
+        placeholders = ",".join("?" * len(unique))
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"SELECT name, auto_type, manual_type, hands, vpip, pfr, af, fold_cbet, wtsd "
+                    f"FROM player_types WHERE name IN ({placeholders})",
+                    unique,
+                ).fetchall()
+                result: Dict[str, Dict[str, Any]] = {}
+                for row in rows:
+                    result[row[0]] = {
+                        "auto_type": row[1], "manual_type": row[2], "hands": row[3],
+                        "vpip": row[4], "pfr": row[5], "af": row[6],
+                        "fold_cbet": row[7], "wtsd": row[8],
+                        "effective_type": row[2] if row[2] else row[1],
+                    }
+                return result
+            finally:
+                conn.close()
+
+    def count_player_types(self) -> int:
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM player_types WHERE hands > 0"
+                ).fetchone()
+                return int(row[0]) if row else 0
             finally:
                 conn.close()
 

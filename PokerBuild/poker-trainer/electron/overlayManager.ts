@@ -1,5 +1,6 @@
 import { BrowserWindow, screen } from 'electron';
 import path from 'path';
+import { ELECTRON_ROOT } from './electronPaths';
 
 interface WindowBounds {
   x: number;
@@ -53,7 +54,7 @@ export class OverlayManager {
       webPreferences: {
         nodeIntegration: true,
         contextIsolation: true,
-        preload: path.join(__dirname, 'preload.js'), // Ensure this path is correct relative to build
+        preload: path.join(ELECTRON_ROOT, 'preload.js'),
       },
       focusable: false, // Important so it doesn't steal focus from the poker table
     });

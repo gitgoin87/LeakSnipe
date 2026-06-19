@@ -13,6 +13,7 @@ import {
 import { buildReplayerSteps, parseShownCards, type ReplayerStep } from "../lib/replayerSteps";
 import { buildSeatDisplayMap, seatFraction } from "../lib/seatLayout";
 import { parseCardList, PlayingCard } from "./PlayingCard";
+import { OpponentHudPanel } from "./OpponentHud";
 
 type HandReplayerProps = {
   hand: HandDetail;
@@ -90,6 +91,10 @@ export function HandReplayer({ hand, onClose }: HandReplayerProps) {
     .filter((e) => !Number.isNaN(e.seat))
     .sort((a, b) => a.seat - b.seat);
 
+  const opponentNames = seatEntries
+    .filter(({ info }) => !info.is_hero)
+    .map(({ info }) => info.name);
+
   const buttonSeat = hand.button_seat;
   const buttonPos =
     buttonSeat && hand.players[String(buttonSeat)]
@@ -117,6 +122,8 @@ export function HandReplayer({ hand, onClose }: HandReplayerProps) {
         <span>{hand.table_name || hand.game_type}</span>
         {isTournament ? <span className="tourney-badge">Tournament</span> : null}
       </div>
+
+      <OpponentHudPanel names={opponentNames} compact title="Table HUD" />
 
       <div className="replayer-table-wrap">
         <div className="replayer-table">

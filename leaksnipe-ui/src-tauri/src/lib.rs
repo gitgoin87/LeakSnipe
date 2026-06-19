@@ -247,6 +247,9 @@ fn wait_for_healthy_sidecar(port: u16, attempts: u32, delay: Duration) -> bool {
 }
 
 fn free_api_port(port: u16) {
+    if sidecar_managed_externally() {
+        return;
+    }
     if sidecar_healthy(port) {
         return;
     }
@@ -330,6 +333,13 @@ fn spawn_backend(force: bool) -> Result<SpawnOutcome, String> {
                 child: None,
                 external: true,
             });
+        }
+        if sidecar_managed_externally() {
+            return Err(format!(
+                "External sidecar on port {port} did not respond to /health within 20s. \
+                 Check Start-Sidecar.bat or the sidecar console window. Log: {}",
+                sidecar_log_path().display()
+            ));
         }
         eprintln!("[leaksnipe-ui] Port {port} still unhealthy after 20s - clearing stale listener");
         free_api_port(port);
@@ -484,7 +494,7 @@ fn sidecar_start_script() -> PathBuf {
     repo_root().join("scripts").join("start-sidecar.ps1")
 }
 
-fn launch_sidecar_via_ps1() -> Result<(), String> {
+fn launch_sidecar_via_ps1(wait_for_script: bool) -> Result<(), String> {
     let port = api_port();
     if sidecar_healthy(port) {
         eprintln!("[leaksnipe-ui] Sidecar already healthy on port {port} - skipping start-sidecar.ps1");
@@ -501,26 +511,44 @@ fn launch_sidecar_via_ps1() -> Result<(), String> {
     }
     let ps1_path = normalize_windows_path(&ps1);
     let root_path = normalize_windows_path(&root);
-    let status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &ps1_path,
-        ])
-        .current_dir(&root_path)
-        .env("LEAKSNIPE_ROOT", &root_path)
-        .status()
-        .map_err(|err| format!("Could not run start-sidecar.ps1: {err}"))?;
-    if status.success() {
-        Ok(())
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &ps1_path,
+    ])
+    .current_dir(&root_path)
+    .env("LEAKSNIPE_ROOT", &root_path);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    if wait_for_script {
+        let status = cmd
+            .status()
+            .map_err(|err| format!("Could not run start-sidecar.ps1: {err}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "start-sidecar.ps1 failed (exit {}). Run Start-Sidecar.bat manually. Log: {}",
+                status.code().unwrap_or(-1),
+                sidecar_log_path().display()
+            ))
+        }
     } else {
-        Err(format!(
-            "start-sidecar.ps1 failed (exit {}). Run Start-Sidecar.bat manually. Log: {}",
-            status.code().unwrap_or(-1),
-            sidecar_log_path().display()
-        ))
+        cmd.spawn()
+            .map_err(|err| format!("Could not start start-sidecar.ps1: {err}"))?;
+        eprintln!(
+            "[leaksnipe-ui] start-sidecar.ps1 launched in background — UI will poll /health"
+        );
+        Ok(())
     }
 }
 
@@ -539,8 +567,10 @@ fn stop_backend(state: &BackendProcess) {
 
 const MAX_SIDECAR_RESTART_FAILURES: u32 = 3;
 const SIDECAR_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
+const SIDECAR_STARTUP_GRACE: Duration = Duration::from_secs(45);
 
 fn start_sidecar_monitor(state: BackendProcess) {
+    let started_at = Instant::now();
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(15));
@@ -551,7 +581,23 @@ fn start_sidecar_monitor(state: BackendProcess) {
                         guard.external = true;
                     }
                     guard.restart_failures = 0;
+                    guard.last_error.clear();
                 }
+                continue;
+            }
+
+            if started_at.elapsed() < SIDECAR_STARTUP_GRACE
+                && (sidecar_managed_externally()
+                    || state
+                        .0
+                        .lock()
+                        .map(|g| g.external)
+                        .unwrap_or(false))
+            {
+                eprintln!(
+                    "[leaksnipe-ui] Sidecar still warming up ({}s grace) — skipping auto-restart",
+                    SIDECAR_STARTUP_GRACE.as_secs()
+                );
                 continue;
             }
 
@@ -608,9 +654,9 @@ fn start_sidecar_monitor(state: BackendProcess) {
                 .lock()
                 .map(|g| g.external)
                 .unwrap_or(false);
-            let restart_result = if external_only {
-                launch_sidecar_via_ps1().and_then(|()| {
-                    if sidecar_healthy(port) {
+            let restart_result = if external_only || sidecar_managed_externally() {
+                launch_sidecar_via_ps1(true).and_then(|()| {
+                    if wait_for_healthy_sidecar(port, 40, Duration::from_millis(500)) {
                         Ok(SpawnOutcome {
                             child: None,
                             external: true,
@@ -772,9 +818,11 @@ fn launch_python_hud() -> Result<(), String> {
         }
 
         if let Ok(file) = log_file {
-            let _ = cmd.stdout(Stdio::from(file.try_clone().unwrap_or_else(|_| {
-                std::fs::File::open(&log_path).unwrap()
-            })));
+            if let Ok(clone) = file.try_clone() {
+                let _ = cmd.stdout(Stdio::from(clone));
+            } else {
+                cmd.stdout(Stdio::null());
+            }
             let _ = cmd.stderr(Stdio::from(file));
         } else {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -863,8 +911,26 @@ fn restart_sidecar(state: State<BackendProcess>) -> Result<(), String> {
         );
         return Ok(());
     }
+    let external = sidecar_managed_externally()
+        || state
+            .0
+            .lock()
+            .map(|g| g.external)
+            .unwrap_or(false);
+    if external {
+        launch_sidecar_via_ps1(false)?;
+        apply_spawn(
+            &state,
+            SpawnOutcome {
+                child: None,
+                external: true,
+            },
+        );
+        return Ok(());
+    }
     stop_backend(&state);
-    if launch_sidecar_via_ps1().is_ok() && sidecar_healthy(port) {
+    launch_sidecar_via_ps1(false)?;
+    if sidecar_healthy(port) {
         apply_spawn(
             &state,
             SpawnOutcome {
@@ -892,13 +958,7 @@ fn launch_sidecar_window(state: State<BackendProcess>) -> Result<(), String> {
         );
         return Ok(());
     }
-    launch_sidecar_via_ps1()?;
-    if !wait_for_healthy_sidecar(port, 60, Duration::from_millis(500)) {
-        return Err(format!(
-            "Sidecar did not become healthy after start-sidecar.ps1. Log: {}",
-            sidecar_log_path().display()
-        ));
-    }
+    launch_sidecar_via_ps1(false)?;
     apply_spawn(
         &state,
         SpawnOutcome {
@@ -911,9 +971,12 @@ fn launch_sidecar_window(state: State<BackendProcess>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let port = api_port();
+    let external_on_start =
+        sidecar_managed_externally() || sidecar_healthy_cached(port);
     let backend = BackendProcess(Arc::new(Mutex::new(BackendState {
         child: None,
-        external: false,
+        external: external_on_start,
         last_error: String::new(),
         last_restart_attempt: None,
         restart_failures: 0,
